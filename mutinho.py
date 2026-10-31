@@ -8,19 +8,28 @@ Uso:
     python mutinho.py --no-gui   # sem interface (mostra o QR no terminal)
     python mutinho.py --fake     # microfone simulado, para testes
 """
+import hashlib
 import json
 import os
 import platform
 import queue
+import re
 import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import urllib.request
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
+APP_VERSION = "1.2.0"
+# Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
+# Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
+UPDATE_URL = "https://mutinho.vercel.app/version.json"
 SYSTEM = platform.system()  # "Windows", "Darwin" ou "Linux"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mutinho.json")
 
@@ -32,6 +41,10 @@ DEFAULTS = {
     "on_top": False,
     "indicator": False,
     "start_hidden": False,
+    "ns_enabled": False,
+    "ns_intensity": 60,
+    "ns_in": "",
+    "ns_out": "",
     "mac_prev_volume": 70,
 }
 
@@ -191,6 +204,7 @@ class Controller:
         self.backend = backend
         self.lock = threading.RLock()
         self.events = queue.Queue()
+        self.last_muted = False  # usado pela redução de ruído para silenciar a saída
 
     def is_muted(self):
         with self.lock:
@@ -200,6 +214,7 @@ class Controller:
         with self.lock:
             self.backend.set_muted(muted)
             state = self.backend.is_muted()
+        self.last_muted = state
         if self.cfg["sound"]:
             play_sound("mute" if state else "unmute")
         self.events.put(("refresh", None))
@@ -482,6 +497,335 @@ def local_ip():
 
 
 # --------------------------------------------------------------------------
+# Redução de ruído
+# --------------------------------------------------------------------------
+class NoiseReducer:
+    """Subtração espectral adaptativa (STFT de 20 ms, 50% de sobreposição).
+
+    Estima o ruído de fundo continuamente (rastreia o piso de energia de cada
+    frequência) e atenua o que está perto desse piso. `intensity` vai de 0 a 100:
+    0 = sem alteração; 100 = máxima supressão (até -30 dB, com mais agressividade).
+    """
+
+    RATE = 48000
+    HOP = 480      # 10 ms
+    FRAME = 960    # 20 ms
+
+    # parâmetros de ajuste
+    PS_SMOOTH = 0.85   # suavização da energia por frequência (0..1, maior = mais lenta)
+    NOISE_UP = 1.004   # velocidade com que o piso de ruído sobe por bloco
+    NOISE_DOWN = 0.3   # velocidade com que o piso acompanha quedas
+    BIAS = 2.5         # compensa o piso estimado ficar abaixo da média real do ruído
+    PU_MIX = 0.4       # peso da energia instantânea (resto = suavizada)
+    ATTACK = 0.5       # abertura do ganho (fala)
+    RELEASE = 0.3      # fechamento do ganho
+    BETA_MIN = 0.3     # agressividade com intensidade 0+
+    BETA_RANGE = 1.0   # quanto a agressividade cresce até intensidade 100
+    FREQ_SMOOTH = True  # suaviza a energia entre frequências vizinhas (menos "chiado picotado")
+
+    def __init__(self):
+        import numpy as np
+
+        self.np = np
+        n = self.FRAME
+        self.win = np.sqrt(0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / n))
+        self.freqs = np.fft.rfftfreq(n, 1.0 / self.RATE)
+        self.kernel = np.array([0.25, 0.5, 0.25])
+        self.intensity = 60
+        self.reset()
+
+    def reset(self):
+        np = self.np
+        bins = self.FRAME // 2 + 1
+        self.prev = np.zeros(self.HOP)
+        self.ola = np.zeros(self.HOP)
+        self.noise = None
+        self.ps = np.zeros(bins)
+        self.gain = np.ones(bins)
+
+    def process(self, x):
+        """Processa exatamente HOP amostras (float, -1..1) e devolve HOP amostras."""
+        np = self.np
+        frame = np.concatenate((self.prev, x))
+        self.prev = np.array(x, dtype=float)
+        spec = np.fft.rfft(frame * self.win)
+        p = spec.real ** 2 + spec.imag ** 2 + 1e-12
+        if self.FREQ_SMOOTH:
+            p = np.convolve(p, self.kernel, mode="same")  # média entre frequências vizinhas
+
+        if self.noise is None:
+            self.noise = p.copy()
+            self.ps = p.copy()
+        self.ps = self.PS_SMOOTH * self.ps + (1.0 - self.PS_SMOOTH) * p
+        # piso de ruído: desce rápido quando a energia cai, sobe devagar
+        self.noise = np.where(self.ps < self.noise,
+                              (1.0 - self.NOISE_DOWN) * self.noise + self.NOISE_DOWN * self.ps,
+                              self.noise * self.NOISE_UP)
+
+        t = max(0.0, min(1.0, self.intensity / 100.0))
+        if t <= 0.0:
+            self.gain = np.ones_like(self.gain)
+            g = self.gain
+        else:
+            beta = self.BETA_MIN + self.BETA_RANGE * t  # agressividade
+            gmin = 10 ** ((-6.0 - 24.0 * t) / 20.0)     # atenuação máxima: -6 dB a -30 dB
+            pu = self.PU_MIX * p + (1.0 - self.PU_MIX) * self.ps
+            # relação sinal/ruído por frequência -> ganho suave (estilo Wiener)
+            xi = np.maximum(pu / (self.BIAS * self.noise) - 1.0, 0.0)
+            target = np.clip(xi / (xi + beta), gmin, 1.0)
+            # abre rápido (início de fala) e fecha devagar (cauda das palavras)
+            self.gain = np.where(target > self.gain,
+                                 (1.0 - self.ATTACK) * self.gain + self.ATTACK * target,
+                                 (1.0 - self.RELEASE) * self.gain + self.RELEASE * target)
+            g = np.where(self.freqs < 75.0, np.minimum(self.gain, gmin), self.gain)
+
+        y = np.fft.irfft(spec * g, n=self.FRAME) * self.win
+        out = self.ola + y[: self.HOP]
+        self.ola = y[self.HOP:]
+        return out
+
+
+class NoiseSuppressor:
+    """Captura o microfone, limpa o áudio e envia para uma saída (microfone virtual)."""
+
+    def __init__(self, ctrl):
+        self.ctrl = ctrl
+        self.reducer = None
+        self.stream = None
+        self.running = False
+        self.in_level = 0.0
+        self.out_level = 0.0
+        self._inbuf = None
+        self._outbuf = None
+
+    @staticmethod
+    def available():
+        try:
+            import numpy  # noqa: F401
+            import sounddevice  # noqa: F401
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    @staticmethod
+    def devices():
+        """Dispositivos da API de áudio padrão: ([(idx, nome)], [(idx, nome)])."""
+        import sounddevice as sd
+
+        host = sd.query_devices(kind="input")["hostapi"]
+        ins, outs = [], []
+        for i, d in enumerate(sd.query_devices()):
+            if d["hostapi"] != host:
+                continue
+            if d["max_input_channels"] > 0:
+                ins.append((i, d["name"]))
+            if d["max_output_channels"] > 0:
+                outs.append((i, d["name"]))
+        return ins, outs
+
+    @staticmethod
+    def default_input_name():
+        import sounddevice as sd
+
+        return sd.query_devices(kind="input")["name"]
+
+    @staticmethod
+    def guess_virtual(outs):
+        for _, name in outs:
+            low = name.lower()
+            if "cable input" in low or "vb-audio" in low or ("voicemeeter" in low and "input" in low):
+                return name
+        return None
+
+    def set_intensity(self, value):
+        if self.reducer is None:
+            self.reducer = NoiseReducer()
+        self.reducer.intensity = int(value)
+
+    def start(self, in_name, out_name):
+        """Devolve None se deu certo, ou uma mensagem de erro."""
+        self.stop()
+        ok, err = self.available()
+        if not ok:
+            return f"Faltam bibliotecas: {err}"
+        import sounddevice as sd
+
+        try:
+            ins, outs = self.devices()
+        except Exception as exc:
+            return f"Não consegui listar os dispositivos de áudio: {exc}"
+        in_idx = next((i for i, n in ins if n == in_name), None)
+        out_idx = next((i for i, n in outs if n == out_name), None)
+        if in_idx is None:
+            return "Escolha o seu microfone."
+        if out_idx is None:
+            return "Escolha a saída (o microfone virtual, ex.: CABLE Input)."
+
+        if self.reducer is None:
+            self.reducer = NoiseReducer()
+        self.reducer.reset()
+        np = self.reducer.np
+        self._inbuf = np.zeros(0)
+        # pré-enche 10 ms: garante que a saída nunca fique sem amostras (evita estalos)
+        self._outbuf = np.zeros(NoiseReducer.HOP)
+        out_ch = max(1, min(2, int(sd.query_devices(out_idx)["max_output_channels"])))
+        try:
+            self.stream = sd.Stream(samplerate=NoiseReducer.RATE, blocksize=NoiseReducer.HOP,
+                                    device=(in_idx, out_idx), channels=(1, out_ch),
+                                    dtype="float32", latency="low", callback=self._callback)
+            self.stream.start()
+        except Exception as exc:
+            self.stream = None
+            return f"Não consegui abrir o áudio: {exc}"
+        self.running = True
+        return None
+
+    def _callback(self, indata, outdata, frames, time_info, status):
+        np = self.reducer.np
+        hop = NoiseReducer.HOP
+        try:
+            x = np.asarray(indata[:, 0], dtype=float)
+            self.in_level = 0.7 * self.in_level + 0.3 * float(np.sqrt(np.mean(x * x)))
+            self._inbuf = np.concatenate((self._inbuf, x))
+            while len(self._inbuf) >= hop:
+                block = self._inbuf[:hop]
+                self._inbuf = self._inbuf[hop:]
+                self._outbuf = np.concatenate((self._outbuf, self.reducer.process(block)))
+            y = np.zeros(frames)
+            n = min(frames, len(self._outbuf))
+            y[:n] = self._outbuf[:n]
+            self._outbuf = self._outbuf[n:]
+            if self.ctrl.last_muted:
+                y[:] = 0.0
+            y = np.clip(y, -1.0, 1.0)
+            self.out_level = 0.7 * self.out_level + 0.3 * float(np.sqrt(np.mean(y * y)))
+            outdata[:] = y.astype("float32")[:, None]
+        except Exception:
+            outdata[:] = 0
+
+    def stop(self):
+        self.running = False
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        self.in_level = 0.0
+        self.out_level = 0.0
+
+
+# --------------------------------------------------------------------------
+# Atualização automática
+# --------------------------------------------------------------------------
+_UA = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+
+
+def parse_version(text):
+    return tuple(int(x) for x in re.findall(r"\d+", str(text))[:4])
+
+
+def update_enabled():
+    return bool(UPDATE_URL) and "SEU-SITE" not in UPDATE_URL
+
+
+def site_url():
+    return urljoin(UPDATE_URL, "./")
+
+
+def _safe_url(url):
+    p = urlparse(url)
+    return p.scheme == "https" or (p.scheme == "http" and p.hostname in ("localhost", "127.0.0.1"))
+
+
+def check_for_update():
+    """Devolve um dict com os dados da versão nova, ou None (sem versão nova ou sem internet)."""
+    if not update_enabled():
+        return None
+    try:
+        req = urllib.request.Request(UPDATE_URL, headers=_UA)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+        if parse_version(info["version"]) <= parse_version(APP_VERSION):
+            return None
+        info["url"] = urljoin(UPDATE_URL, info.get("url") or "dist/Mutinho.exe")
+        return info
+    except Exception:
+        return None
+
+
+def can_self_update():
+    """Só o .exe empacotado no Windows, em pasta onde o usuário pode gravar, troca a si mesmo."""
+    if not (getattr(sys, "frozen", False) and SYSTEM == "Windows"):
+        return False
+    return os.access(os.path.dirname(sys.executable), os.W_OK)
+
+
+def update_path():
+    return os.path.join(os.path.dirname(sys.executable), "Mutinho.update")
+
+
+def download_update(info, progress=None, dest=None):
+    """Baixa o .exe novo e confere o SHA-256. Levanta exceção se algo estiver errado."""
+    url = info.get("url", "")
+    sha = str(info.get("sha256", "")).strip().lower()
+    if not _safe_url(url):
+        raise ValueError("endereço de download inseguro")
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise ValueError("a atualização não tem verificação de integridade")
+    dest = dest or update_path()
+    digest = hashlib.sha256()
+    done = 0
+    try:
+        req = urllib.request.Request(url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+                digest.update(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+        if digest.hexdigest() != sha:
+            raise ValueError("o arquivo baixado não confere (verificação de integridade falhou)")
+    except Exception:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
+def apply_update(new_path):
+    """Troca o .exe depois que o app fechar e abre de novo (feito por um script .bat)."""
+    exe = sys.executable
+    bat = os.path.join(tempfile.gettempdir(), "mutinho_update.bat")
+    script = (
+        "@echo off\r\n"
+        "set TRIES=0\r\n"
+        ":wait\r\n"
+        "ping 127.0.0.1 -n 2 > nul\r\n"
+        f'move /Y "{new_path}" "{exe}" > nul 2>&1\r\n'
+        "if not errorlevel 1 goto done\r\n"
+        "set /a TRIES+=1\r\n"
+        "if %TRIES% LSS 40 goto wait\r\n"
+        ":done\r\n"
+        f'start "" "{exe}"\r\n'
+        '(goto) 2>nul & del "%~f0"\r\n'
+    )
+    with open(bat, "w", encoding="mbcs", errors="replace") as f:
+        f.write(script)
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # o novo .exe começa do zero
+    subprocess.Popen(["cmd", "/c", bat], env=env, close_fds=True,
+                     creationflags=0x08000000 | 0x00000008)  # sem janela + desanexado
+
+
+# --------------------------------------------------------------------------
 # Ícone na bandeja do sistema (perto do relógio)
 # --------------------------------------------------------------------------
 class Tray:
@@ -566,6 +910,8 @@ class GUI:
         self.recording = False
         self.indicator = None
         self.tray = None
+        self.update_info = None
+        self.updating = False
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
@@ -585,6 +931,7 @@ class GUI:
         self.refresh()
         self.root.after(100, self._pump_events)
         self.root.after(1500, self._poll_state)
+        self._start_update_check()
         if self.cfg["indicator"]:
             self._set_indicator(True)
 
@@ -613,9 +960,24 @@ class GUI:
     def _build(self):
         tk = self.tk
         root = self.root
+        left = tk.Frame(root, bg=self.BG)          # coluna da esquerda: controle principal
+        left.pack(side="left", anchor="n")
+        right = tk.Frame(root, bg=self.BG)         # coluna da direita: redução de ruído
+        right.pack(side="left", anchor="n", pady=(44, 0), padx=(0, 6))
+        root = left
 
-        tk.Label(root, text="MUTINHO", bg=self.BG, fg=self.DIM,
-                 font=("Helvetica", 11, "bold")).pack(pady=(16, 6))
+        self.header = tk.Label(root, text=f"MUTINHO  v{APP_VERSION}", bg=self.BG, fg=self.DIM,
+                               font=("Helvetica", 11, "bold"))
+        self.header.pack(pady=(16, 6))
+
+        # aviso de atualização (só aparece quando há versão nova)
+        self.update_bar = tk.Frame(root, bg="#14301f", padx=12, pady=8)
+        self.update_text = tk.Label(self.update_bar, text="", bg="#14301f", fg=self.FG,
+                                    font=("Helvetica", 9, "bold"))
+        self.update_text.pack(side="left", padx=(0, 10))
+        self.update_btn = self._button(self.update_bar, "Atualizar agora", self._do_update,
+                                       bg=self.LIVE)
+        self.update_btn.pack(side="right")
 
         self.circle = tk.Canvas(root, width=160, height=160, bg=self.BG,
                                 highlightthickness=0, cursor="hand2")
@@ -676,6 +1038,8 @@ class GUI:
                             wraplength=340)
         self.msg.pack(pady=(0, 12))
 
+        self._build_noise(right)
+
     # ---- QR ---------------------------------------------------------------
     def _draw_qr(self):
         import qrcode
@@ -719,6 +1083,7 @@ class GUI:
         except Exception as exc:
             self._say(f"Não consegui ler o microfone: {exc}")
             return
+        self.ctrl.last_muted = self.muted
         color = self.MUTE if self.muted else self.LIVE
         self.circle.itemconfigure(self.circle_shape, fill=color)
         self.circle.itemconfigure(self.circle_icon, text="🔇" if self.muted else "🎙")
@@ -749,6 +1114,26 @@ class GUI:
                 elif kind == "quit":
                     self.quit()
                     return
+                elif kind == "update":
+                    self._show_update(payload)
+                elif kind == "update_progress":
+                    done, total = payload
+                    pct = f"{int(done * 100 / total)}%" if total else "…"
+                    self.update_btn.configure(text=f"Baixando {pct}")
+                elif kind == "update_error":
+                    self.updating = False
+                    self.update_btn.configure(text="Tentar de novo")
+                    self._say(f"Não foi possível atualizar: {payload}")
+                elif kind == "update_ready":
+                    try:
+                        apply_update(payload)
+                    except Exception as exc:
+                        self.updating = False
+                        self.update_btn.configure(text="Tentar de novo")
+                        self._say(f"Não foi possível aplicar a atualização: {exc}")
+                    else:
+                        self.quit()
+                        return
         except queue.Empty:
             pass
         self.root.after(100, self._pump_events)
@@ -816,6 +1201,206 @@ class GUI:
             self.indicator = None
 
     # ---- ciclo de vida ----------------------------------------------------
+    # ---- atualização automática -------------------------------------------
+    def _start_update_check(self):
+        if not update_enabled():
+            return
+
+        def work():
+            info = check_for_update()
+            if info:
+                self.ctrl.events.put(("update", info))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_update(self, info):
+        self.update_info = info
+        self.update_text.configure(text=f"Nova versão {info['version']} disponível")
+        self.update_btn.configure(text="Atualizar agora" if can_self_update() else "Baixar no site")
+        self.update_bar.pack(after=self.header, fill="x", padx=18, pady=(0, 6))
+        notes = info.get("notes")
+        if notes:
+            self._say(f"Novidades: {notes}")
+
+    def _do_update(self):
+        if self.updating or not self.update_info:
+            return
+        if not can_self_update():
+            webbrowser.open(site_url())
+            return
+        self.updating = True
+        self.update_btn.configure(text="Baixando…")
+        info = self.update_info
+
+        def work():
+            try:
+                path = download_update(
+                    info, lambda d, t: self.ctrl.events.put(("update_progress", (d, t))))
+                self.ctrl.events.put(("update_ready", path))
+            except Exception as exc:
+                self.ctrl.events.put(("update_error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- redução de ruído -------------------------------------------------
+    def _style_menu(self, menu_button):
+        menu_button.configure(bg=self.BG, fg=self.FG, activebackground=self.ACCENT,
+                              activeforeground="white", highlightthickness=0, bd=0,
+                              relief="flat", anchor="w", width=34)
+        menu_button["menu"].configure(bg=self.CARD, fg=self.FG, activebackground=self.ACCENT,
+                                      activeforeground="white", bd=0)
+
+    def _build_noise(self, parent):
+        tk = self.tk
+        self.ns = NoiseSuppressor(self.ctrl)
+        card = self._card(parent)
+        tk.Label(card, text="Redução de ruído", bg=self.CARD, fg=self.DIM,
+                 font=("Helvetica", 9)).pack(anchor="w")
+
+        ok, _err = NoiseSuppressor.available()
+        if not ok:
+            tk.Label(card, text="Recurso opcional. Para ativar, instale as bibliotecas:\n\n"
+                                "python -m pip install numpy sounddevice\n\n"
+                                "e abra o Mutinho de novo.",
+                     bg=self.CARD, fg=self.DIM, justify="left", wraplength=290,
+                     font=("Helvetica", 9)).pack(anchor="w", pady=(8, 0))
+            return
+
+        self.var_ns = tk.BooleanVar(value=False)
+        tk.Checkbutton(card, text="Ativar redução de ruído", variable=self.var_ns,
+                       command=self._ns_toggle, bg=self.CARD, fg=self.FG, selectcolor=self.BG,
+                       activebackground=self.CARD, activeforeground=self.FG,
+                       highlightthickness=0, bd=0, anchor="w").pack(fill="x", pady=(6, 0))
+
+        self.ns_label = tk.Label(card, text="", bg=self.CARD, fg=self.FG,
+                                 font=("Helvetica", 10, "bold"))
+        self.ns_label.pack(anchor="w", pady=(8, 0))
+        self.ns_scale = tk.Scale(card, from_=0, to=100, orient="horizontal", showvalue=False,
+                                 length=290, command=self._ns_intensity, bg=self.CARD, fg=self.FG,
+                                 troughcolor=self.BG, highlightthickness=0, bd=0, sliderlength=22,
+                                 width=14, activebackground=self.ACCENT)
+        self.ns_scale.set(int(self.cfg["ns_intensity"]))
+        self.ns_scale.bind("<ButtonRelease-1>", lambda e: self._ns_save_intensity())
+        self.ns_scale.pack(fill="x")
+        ends = tk.Frame(card, bg=self.CARD)
+        ends.pack(fill="x")
+        tk.Label(ends, text="Leve", bg=self.CARD, fg=self.DIM, font=("Helvetica", 8)).pack(side="left")
+        tk.Label(ends, text="Forte", bg=self.CARD, fg=self.DIM, font=("Helvetica", 8)).pack(side="right")
+
+        tk.Label(card, text="Seu microfone", bg=self.CARD, fg=self.DIM,
+                 font=("Helvetica", 9)).pack(anchor="w", pady=(10, 2))
+        self.ns_in = tk.StringVar()
+        self.ns_in_menu = tk.OptionMenu(card, self.ns_in, "")
+        self._style_menu(self.ns_in_menu)
+        self.ns_in_menu.pack(fill="x")
+
+        tk.Label(card, text="Enviar o áudio limpo para (microfone virtual)", bg=self.CARD, fg=self.DIM,
+                 font=("Helvetica", 9)).pack(anchor="w", pady=(10, 2))
+        self.ns_out = tk.StringVar()
+        self.ns_out_menu = tk.OptionMenu(card, self.ns_out, "")
+        self._style_menu(self.ns_out_menu)
+        self.ns_out_menu.pack(fill="x")
+
+        self.ns_meter = tk.Canvas(card, width=290, height=36, bg=self.CARD, highlightthickness=0)
+        self.ns_meter.pack(pady=(12, 0))
+
+        self.ns_status = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=290,
+                                  justify="left", font=("Helvetica", 9, "bold"))
+        self.ns_status.pack(anchor="w", pady=(6, 0))
+        self.ns_help = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=290,
+                                justify="left", font=("Helvetica", 8))
+        self.ns_help.pack(anchor="w", pady=(4, 8))
+        self._button(card, "Atualizar dispositivos", self._ns_refresh_devices,
+                     bg="#4b5563").pack(anchor="w")
+
+        self._ns_refresh_devices()
+        if self.cfg["ns_enabled"]:
+            self.var_ns.set(True)
+            self._ns_toggle()
+        self.root.after(200, self._ns_meter)
+
+    def _fill_menu(self, menu_button, var, names, preferred, fallback_first):
+        menu = menu_button["menu"]
+        menu.delete(0, "end")
+        for name in names:
+            menu.add_command(label=name, command=lambda v=name, s=var: self._ns_pick(s, v))
+        if preferred in names:
+            var.set(preferred)
+        elif fallback_first and names:
+            var.set(names[0])
+        else:
+            var.set("(escolha)")
+
+    def _ns_refresh_devices(self):
+        try:
+            ins, outs = NoiseSuppressor.devices()
+            default_in = NoiseSuppressor.default_input_name()
+        except Exception as exc:
+            self._say(f"Não consegui listar os dispositivos de áudio: {exc}")
+            return
+        in_names = [n for _, n in ins]
+        out_names = [n for _, n in outs]
+        virtual = NoiseSuppressor.guess_virtual(outs)
+        self._fill_menu(self.ns_in_menu, self.ns_in, in_names,
+                        self.cfg["ns_in"] or default_in, True)
+        self._fill_menu(self.ns_out_menu, self.ns_out, out_names,
+                        self.cfg["ns_out"] or virtual, False)
+        if virtual:
+            self.ns_help.configure(
+                text="Microfone virtual encontrado. Nos aplicativos (Meet, Discord, Zoom), "
+                     "escolha \"CABLE Output\" como microfone. Use fones para evitar eco.")
+        else:
+            self.ns_help.configure(
+                text="Para os outros programas ouvirem o áudio limpo, instale o VB-Cable "
+                     "(vb-audio.com/Cable), reabra o Mutinho, escolha \"CABLE Input\" acima e, "
+                     "nos aplicativos, use \"CABLE Output\" como microfone.")
+
+    def _ns_pick(self, var, value):
+        var.set(value)
+        self.cfg["ns_in"] = self.ns_in.get()
+        self.cfg["ns_out"] = self.ns_out.get()
+        if self.var_ns.get():
+            self._ns_toggle()  # reinicia com os dispositivos novos
+
+    def _ns_toggle(self):
+        if self.var_ns.get():
+            err = self.ns.start(self.ns_in.get(), self.ns_out.get())
+            if err:
+                self.var_ns.set(False)
+                self.ns_status.configure(text=err, fg=self.MUTE)
+                return
+            self.cfg["ns_enabled"] = True
+            self.ns_status.configure(text="Ativo: seu áudio está sendo limpo.", fg=self.LIVE)
+        else:
+            self.ns.stop()
+            self.cfg["ns_enabled"] = False
+            self.ns_status.configure(text="", fg=self.DIM)
+
+    def _ns_intensity(self, value):
+        v = int(float(value))
+        self.ns.set_intensity(v)
+        nivel = "desligado" if v == 0 else "leve" if v < 35 else "médio" if v < 70 else "forte"
+        self.ns_label.configure(text=f"Intensidade: {v}%  ({nivel})")
+
+    def _ns_save_intensity(self):
+        self.cfg["ns_intensity"] = int(self.ns_scale.get())
+
+    def _ns_meter(self):
+        import math
+
+        canvas = self.ns_meter
+        canvas.delete("all")
+        rows = (("Entrada", self.ns.in_level, "#6b7280"), ("Saída", self.ns.out_level, self.LIVE))
+        for i, (label, level, color) in enumerate(rows):
+            y = 4 + i * 16
+            frac = 0.0
+            if self.ns.running:
+                frac = min(1.0, max(0.0, (20 * math.log10(max(level, 1e-5)) + 60) / 60))
+            canvas.create_text(0, y + 5, text=label, anchor="w", fill=self.DIM, font=("Helvetica", 8))
+            canvas.create_rectangle(52, y, 290, y + 10, fill=self.BG, outline="")
+            canvas.create_rectangle(52, y, 52 + int(238 * frac), y + 10, fill=color, outline="")
+        self.root.after(100, self._ns_meter)
+
     def show(self):
         self.root.deiconify()
         self.root.lift()
@@ -829,6 +1414,8 @@ class GUI:
             self.quit()
 
     def quit(self):
+        if hasattr(self, "ns"):
+            self.ns.stop()
         if self.tray is not None:
             self.tray.stop()
         self.hotkeys.stop()

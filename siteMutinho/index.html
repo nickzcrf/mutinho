@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#14161a">
 <title>Mutinho — mute seu microfone com um atalho</title>
-<meta name="description" content="Muta o microfone com um atalho global no Windows e desmuta pelo celular lendo um QR code. Grátis.">
+<meta name="description" content="Muta o microfone com um atalho global no Windows, desmuta pelo celular com um QR code, reduz o ruído de fundo e se atualiza com um clique. Grátis.">
 <style>
   :root {
     --bg:#101215; --card:#1a1d23; --line:#2a2e36; --fg:#eceef1; --dim:#9aa0aa;
@@ -32,6 +32,9 @@
   .btn:hover { filter:brightness(1.08); transform:translateY(-1px); }
   .btn:active { transform:translateY(0); }
   .meta { margin:14px 0 0; font-size:13px; color:var(--dim); }
+  .meta + .meta { margin-top:6px; }
+  a.alt { color:var(--dim); text-decoration:underline; text-underline-offset:3px; }
+  a.alt:hover { color:var(--fg); }
 
   .stage { position:relative; display:flex; justify-content:center; align-items:center; min-height:380px; }
   .app { width:250px; background:var(--card); border:1px solid var(--line); border-radius:18px;
@@ -91,9 +94,10 @@
   <header class="hero">
     <div>
       <h1>Muta o microfone com <em>um atalho</em>.</h1>
-      <p class="lead">Desmuta pelo celular, lendo um QR code. Sem cadastro, sem instalar app no celular.</p>
-      <a class="btn" href="dist/Mutinho.exe" download>⬇ Baixar para Windows</a>
-      <p class="meta">Grátis · Windows 10 e 11 · arquivo único, sem instalador</p>
+      <p class="lead">Desmuta pelo celular com um QR code, reduz o ruído de fundo e se atualiza com um clique. Sem cadastro, sem app no celular.</p>
+      <a class="btn" href="dist/MutinhoSetup.exe" download>⬇ Baixar para Windows</a>
+      <p class="meta">Grátis · Windows 10 e 11 · instalador completo</p>
+      <p class="meta"><a class="alt" href="dist/Mutinho.exe" download>Prefere só o app, sem instalar o microfone virtual? Baixe o Mutinho.exe</a></p>
     </div>
 
     <div class="stage" id="stage">
@@ -112,19 +116,22 @@
   </header>
 
   <section>
-    <h2>Feito para uma coisa só</h2>
+    <h2>O que ele faz</h2>
     <div class="grid">
       <div class="card"><h3>Atalho global</h3><p>Muta e desmuta de qualquer programa: Meet, Discord, Zoom, jogos. Você escolhe a combinação de teclas.</p></div>
       <div class="card"><h3>Controle pelo celular</h3><p>Escaneie o QR da janela e use um botão grande no celular. Funciona no mesmo Wi-Fi, sem instalar nada.</p></div>
       <div class="card"><h3>Sempre à vista</h3><p>Indicador flutuante na tela e som ao mutar, para você nunca falar achando que estava ligado.</p></div>
+      <div class="card"><h3>Redução de ruído</h3><p>Diminui ventilador, ar-condicionado e chiado de fundo, com intensidade ajustável de 0 a 100%. Funciona nos seus apps de chamada pelo microfone virtual que vem no instalador.</p></div>
+      <div class="card"><h3>Atualização com um clique</h3><p>Quando sai uma versão nova, o Mutinho avisa na própria janela. Um clique em "Atualizar agora" e ele baixa, confere o arquivo e reabre sozinho.</p></div>
+      <div class="card"><h3>Discreto na bandeja</h3><p>Fechar a janela mantém o Mutinho rodando perto do relógio. Dá para iniciar junto com o Windows, já escondido.</p></div>
     </div>
   </section>
 
   <section id="como-usar">
     <h2>Como usar</h2>
     <div class="grid">
-      <div class="card"><div class="num">1</div><h3>Baixe e abra</h3><p>Dê um duplo clique no <strong>Mutinho.exe</strong>. Se o Windows avisar "protegeu seu PC", clique em <strong>Mais informações</strong> e depois em <strong>Executar assim mesmo</strong>.</p></div>
-      <div class="card"><div class="num">2</div><h3>Libere a rede</h3><p>Quando o firewall perguntar, marque <strong>Redes privadas</strong> e permita. É isso que deixa o celular conectar.</p></div>
+      <div class="card"><div class="num">1</div><h3>Baixe e instale</h3><p>Abra o <strong>MutinhoSetup.exe</strong>. Se o Windows avisar "protegeu seu PC", clique em <strong>Mais informações</strong> e depois em <strong>Executar assim mesmo</strong>. Deixe marcada a opção do microfone virtual se quiser a redução de ruído.</p></div>
+      <div class="card"><div class="num">2</div><h3>Aceite as permissões</h3><p>Se instalou o microfone virtual, aceite as janelas de permissão do Windows e reinicie o PC quando o instalador pedir. Quando o firewall perguntar, marque <strong>Redes privadas</strong>: é isso que deixa o celular conectar.</p></div>
       <div class="card"><div class="num">3</div><h3>Mute e desmute</h3><p>Use <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>M</kbd> no PC ou aponte a câmera do celular para o QR da janela.</p></div>
     </div>
   </section>
@@ -133,6 +140,10 @@
     <h2>Dúvidas</h2>
     <details><summary>Por que o Windows mostra um aviso?</summary><p>O app é de um desenvolvedor independente e não tem assinatura digital paga, então o Windows desconfia de qualquer arquivo novo. Alguns antivírus também reclamam de programas empacotados em Python. É um alerta genérico.</p></details>
     <details><summary>O app grava ou envia meu áudio?</summary><p>Não. Ele só liga e desliga o mudo do microfone do Windows. O controle pelo celular conversa apenas com o seu PC, dentro da sua rede local, por um link com um código secreto que você pode trocar quando quiser.</p></details>
+    <details><summary>O que é o VB-CABLE e eu preciso dele?</summary><p>É um microfone virtual gratuito da VB-Audio, incluído no instalador. Ele só serve para a redução de ruído: o Mutinho envia o áudio limpo para ele e, no Meet, Discord ou Zoom, você escolhe "CABLE Output" como microfone. Se você só quer o atalho e o controle pelo celular, desmarque essa opção na instalação.</p></details>
+    <details><summary>A redução de ruído funciona em qualquer programa?</summary><p>Em qualquer programa que deixe escolher o microfone: nas configurações de áudio dele, selecione "CABLE Output". Ela diminui ruídos constantes, como ventilador, ar-condicionado e chiado. Ruídos que mudam rápido, como teclado e vozes ao fundo, passam em boa parte. Use fones de ouvido para evitar eco.</p></details>
+    <details><summary>Como funcionam as atualizações?</summary><p>Ao abrir, o Mutinho confere se há versão nova. Se houver, aparece um aviso verde na janela com o botão "Atualizar agora": ele baixa, confere a integridade do arquivo e reabre sozinho. Funciona na versão instalada pelo instalador ou no Mutinho.exe, e só em pastas onde seu usuário pode gravar. Se você tem uma versão antiga, baixe uma vez de novo aqui no site; depois disso é automático.</p></details>
+    <details><summary>Preciso reiniciar o PC?</summary><p>Só se você instalar o microfone virtual, porque o driver de áudio só aparece para os programas depois de reiniciar.</p></details>
     <details><summary>Tem para Mac ou Linux?</summary><p>Este download é só para Windows.</p></details>
     <details><summary>O celular não abre a página. E agora?</summary><p>Confira se os dois estão no mesmo Wi-Fi (rede de visitantes costuma isolar os aparelhos) e se o firewall do Windows permitiu o app em redes privadas.</p></details>
     <details><summary>Preciso deixar a janela aberta?</summary><p>Sim, pode minimizar. Se fechar a janela, o atalho e o celular param de funcionar.</p></details>
@@ -140,10 +151,10 @@
 
   <section class="cta">
     <h2>Pronto para nunca mais falar mutado?</h2>
-    <a class="btn" href="dist/Mutinho.exe" download>⬇ Baixar Mutinho</a>
+    <a class="btn" href="dist/MutinhoSetup.exe" download>⬇ Baixar Mutinho</a>
   </section>
 
-  <footer>Mutinho · feito por Nicolas</footer>
+  <footer>Mutinho · feito por Nicolas<br>O instalador inclui o VB-CABLE, microfone virtual criado pela VB-Audio Software (<a class="alt" href="https://vb-cable.com">vb-cable.com</a>). VB-CABLE é donationware: todas as contribuições são bem-vindas.</footer>
 </div>
 
 <script>
