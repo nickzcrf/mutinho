@@ -20,6 +20,25 @@ Com o PC e o celular no mesmo Wi-Fi, abra a câmera do celular e aponte para o Q
 Abre uma página com um botão grande para mutar/desmutar (sem instalar nada).
 "Gerar novo link" invalida o QR antigo.
 
+## Apertar para falar
+
+Na janela, escolha o modo **Apertar para falar** (ao lado de "Alternar"). Nesse modo o microfone fica
+mudo o tempo todo e só abre enquanto você segura:
+- a tecla para falar (padrão **F9**, dá para trocar em "Alterar"), em qualquer programa;
+- o círculo grande da janela, com o mouse;
+- o botão da página do celular (segure o dedo; se o Wi-Fi cair com o dedo apertado, o microfone
+  fecha sozinho em cerca de 1,5 segundo).
+
+Cada modo guarda a sua própria tecla. A tecla para falar continua chegando ao programa que está em foco.
+Ao fechar o Mutinho nesse modo, o microfone fica mudo.
+
+## Tela cheia
+
+Aperte **F11** (ou o botão "Tela cheia" na janela, ou "Tela cheia" no menu do ícone da bandeja) para
+usar o app inteiro em tela cheia: os três painéis (controle e atalho, opções e QR do celular, redução de
+ruído) ficam lado a lado, ampliados para o tamanho da sua tela. **Esc** ou o botão "Sair da tela cheia" volta.
+Tudo funciona igual, inclusive segurar o círculo grande para falar.
+
 ## Redução de ruído
 
 O painel da direita limpa o ruído de fundo (ventilador, ar-condicionado, chiado) do seu microfone,
@@ -88,9 +107,10 @@ Não coloque a pasta `vbcable\` no GitHub se preferir; ela só é necessária pa
 
 - `python mutinho.py --no-gui`: sem janela (mostra o QR no terminal).
 - `python mutinho.py --hidden`: abre já escondido na bandeja.
+- `python mutinho.py --fullscreen`: abre já em tela cheia.
 - Configuração salva em `~/.mutinho.json`.
 
 ## Virar um .exe
 
     python -m pip install pyinstaller
-    python -m PyInstaller --onefile --windowed --name Mutinho --hidden-import pystray._win32 --collect-all sounddevice mutinho.py
+    python -m PyInstaller --onefile --windowed --name Mutinho --hidden-import pystray._win32 --collect-all _sounddevice_data --distpath siteMutinho\dist mutinho.py

@@ -1,6 +1,6 @@
 {
-  "version": "1.2.0",
+  "version": "1.3.0",
   "url": "dist/Mutinho.exe",
-  "sha256": "bb1149295adc575126a58b079ae2ceb09e8e172dd4d14d50fe6524cf961997a9",
-  "notes": ""
+  "sha256": "bb29bd5e631923e8c72cb36e64b8eb5b7a8c66f953a93881e2074dc29374bdbe",
+  "notes": "Apertar para falar e tela cheia"
 }

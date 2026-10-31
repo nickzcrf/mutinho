@@ -20,13 +20,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 # Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
 # Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
 UPDATE_URL = "https://mutinho.vercel.app/version.json"
@@ -41,6 +42,8 @@ DEFAULTS = {
     "on_top": False,
     "indicator": False,
     "start_hidden": False,
+    "mode": "toggle",          # "toggle" (alternar) ou "ptt" (apertar para falar)
+    "ptt_hotkey": "<f9>",
     "ns_enabled": False,
     "ns_intensity": 60,
     "ns_in": "",
@@ -198,6 +201,9 @@ def play_sound(kind):
     threading.Thread(target=_play, daemon=True).start()
 
 
+REMOTE_HOLD_TIMEOUT = 1.5  # segundos sem sinal do celular com o botão apertado => fecha o microfone
+
+
 class Controller:
     def __init__(self, cfg, backend):
         self.cfg = cfg
@@ -205,17 +211,26 @@ class Controller:
         self.lock = threading.RLock()
         self.events = queue.Queue()
         self.last_muted = False  # usado pela redução de ruído para silenciar a saída
+        self._talk_q = queue.Queue()
+        self._talk_thread = None
+        self._beat = None        # instante do último sinal do celular segurando o botão
+        self._watch_thread = None
+        self._seqs = {}          # último número de pedido recebido de cada celular
+
+    # ---- estado básico ----
+    def get_mode(self):
+        return "ptt" if self.cfg["mode"] == "ptt" else "toggle"
 
     def is_muted(self):
         with self.lock:
             return self.backend.is_muted()
 
-    def set_muted(self, muted):
+    def set_muted(self, muted, sound=True):
         with self.lock:
             self.backend.set_muted(muted)
             state = self.backend.is_muted()
         self.last_muted = state
-        if self.cfg["sound"]:
+        if sound and self.cfg["sound"]:
             play_sound("mute" if state else "unmute")
         self.events.put(("refresh", None))
         return state
@@ -229,6 +244,93 @@ class Controller:
             self.toggle()
         except Exception as exc:
             self.events.put(("msg", f"Erro ao alternar: {exc}"))
+
+    # ---- modo ----
+    def set_mode(self, mode):
+        mode = "ptt" if mode == "ptt" else "toggle"
+        self.cfg["mode"] = mode
+        if mode == "ptt":
+            self.set_muted(True, sound=False)  # em apertar para falar o microfone fica fechado
+        self.events.put(("refresh", None))
+        return mode
+
+    def apply_startup(self):
+        """Ao abrir em modo apertar para falar, o microfone começa fechado."""
+        if self.get_mode() == "ptt":
+            try:
+                self.set_muted(True, sound=False)
+            except Exception:
+                pass
+
+    def shutdown(self):
+        """Ao sair, não deixa o microfone aberto no modo apertar para falar."""
+        self._beat = None
+        if self.get_mode() == "ptt":
+            try:
+                self.set_muted(True, sound=False)
+            except Exception:
+                pass
+
+    # ---- apertar para falar ----
+    def talk(self, on):
+        """Microfone aberto enquanto 'on' for verdadeiro (só vale no modo apertar para falar)."""
+        if self.get_mode() != "ptt":
+            return self.is_muted()
+        with self.lock:
+            if self.backend.is_muted() == (not on):
+                return not on  # já está no estado pedido
+        return self.set_muted(not on)
+
+    def talk_async(self, on):
+        """Para ganchos de teclado: não bloqueia e mantém a ordem dos eventos."""
+        self._talk_q.put(bool(on))
+        if self._talk_thread is None or not self._talk_thread.is_alive():
+            self._talk_thread = threading.Thread(target=self._talk_worker, daemon=True)
+            self._talk_thread.start()
+
+    def _talk_worker(self):
+        while True:
+            on = self._talk_q.get()
+            try:
+                self.talk(on)
+            except Exception as exc:
+                self.events.put(("msg", f"Erro ao falar: {exc}"))
+
+    def remote_talk(self, on, client=None, seq=None):
+        """Celular: 'on' enquanto o botão está apertado, com um sinal a cada ~0,4 s.
+        Pedidos atrasados (seq menor que o último do mesmo celular) são ignorados."""
+        with self.lock:
+            if client is not None and seq is not None:
+                if seq < self._seqs.get(client, -1):
+                    return self.backend.is_muted()
+                if len(self._seqs) > 50:
+                    self._seqs.clear()
+                self._seqs[client] = seq
+            self._beat = time.monotonic() if on else None
+        if on:
+            self._ensure_watchdog()
+        return self.talk(on)
+
+    def _ensure_watchdog(self):
+        if self._watch_thread is None or not self._watch_thread.is_alive():
+            self._watch_thread = threading.Thread(target=self._watchdog, daemon=True)
+            self._watch_thread.start()
+
+    def _watchdog(self):
+        """Se o celular parar de avisar que o botão está apertado (sinal fraco, tela
+        bloqueada, Wi-Fi caiu), fecha o microfone sozinho."""
+        while True:
+            time.sleep(0.25)
+            with self.lock:
+                beat = self._beat
+                expired = beat is not None and time.monotonic() - beat > REMOTE_HOLD_TIMEOUT
+                if expired:
+                    self._beat = None
+            if expired:
+                try:
+                    self.talk(False)
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +357,82 @@ class HotkeyManager:
             except Exception:
                 pass
             self.listener = None
+
+
+class ComboTracker:
+    """Detecta quando todas as teclas de uma combinação estão apertadas e quando soltam."""
+
+    def __init__(self, keys, on_down, on_up):
+        self.keys = set(keys)
+        self.down = set()
+        self.active = False
+        self.on_down = on_down
+        self.on_up = on_up
+
+    def press(self, key):
+        if key not in self.keys:
+            return
+        self.down.add(key)
+        if not self.active and self.down == self.keys:
+            self.active = True
+            self.on_down()
+
+    def release(self, key):
+        self.down.discard(key)
+        if self.active and key in self.keys:
+            self.active = False
+            self.on_up()
+
+
+class PushToTalk:
+    """Tecla global de apertar para falar: on_change(True) ao apertar, on_change(False) ao soltar."""
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.listener = None
+        self.tracker = None
+
+    def start(self, combo):
+        from pynput import keyboard
+
+        keys = keyboard.HotKey.parse(combo)  # levanta ValueError se for inválido
+        self.stop()
+        self.tracker = ComboTracker(keys, lambda: self.on_change(True), lambda: self.on_change(False))
+        self.listener = keyboard.Listener(on_press=self._press, on_release=self._release)
+        self.listener.daemon = True
+        self.listener.start()
+
+    def _press(self, key):
+        listener, tracker = self.listener, self.tracker
+        if listener is not None and tracker is not None:
+            tracker.press(listener.canonical(key))
+
+    def _release(self, key):
+        listener, tracker = self.listener, self.tracker
+        if listener is not None and tracker is not None:
+            tracker.release(listener.canonical(key))
+
+    def stop(self):
+        was_active = self.tracker is not None and self.tracker.active
+        if self.listener is not None:
+            try:
+                self.listener.stop()
+            except Exception:
+                pass
+        self.listener = None
+        self.tracker = None
+        if was_active:
+            self.on_change(False)  # não deixa o microfone aberto
+
+
+def activate_hotkeys(cfg, toggle_mgr, ptt_mgr):
+    """Liga só o atalho do modo atual: alternar ou apertar para falar."""
+    toggle_mgr.stop()
+    ptt_mgr.stop()
+    if cfg["mode"] == "ptt":
+        ptt_mgr.start(cfg["ptt_hotkey"])
+    else:
+        toggle_mgr.start(cfg["hotkey"])
 
 
 def record_hotkey(on_done):
@@ -345,10 +523,12 @@ PAGE = """<!doctype html>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body { margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
          font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-         display:flex; flex-direction:column; align-items:center; justify-content:center; gap:28px; padding:24px; }
+         display:flex; flex-direction:column; align-items:center; justify-content:center; gap:28px; padding:24px;
+         -webkit-user-select:none; user-select:none; }
   h1 { margin:0; font-size:20px; font-weight:600; letter-spacing:.5px; color:var(--dim); }
   #btn { width:min(72vw, 300px); aspect-ratio:1; border-radius:50%; border:0; font-size:84px; color:#fff;
-         background:var(--live); box-shadow:0 0 0 14px rgba(34,197,94,.18); transition:all .15s; }
+         background:var(--live); box-shadow:0 0 0 14px rgba(34,197,94,.18); transition:all .15s;
+         touch-action:none; -webkit-touch-callout:none; }
   #btn.muted { background:var(--mute); box-shadow:0 0 0 14px rgba(239,68,68,.18); }
   #btn:active { transform:scale(.96); }
   #label { font-size:22px; font-weight:600; text-align:center; }
@@ -357,33 +537,79 @@ PAGE = """<!doctype html>
 </head>
 <body>
   <h1>MUTINHO</h1>
-  <button id="btn" aria-label="Alternar microfone">🎙️</button>
+  <button id="btn" aria-label="Botão do microfone">🎙️</button>
   <div id="label">Conectando…</div>
   <div id="hint"></div>
 <script>
 const token = new URLSearchParams(location.search).get('t') || '';
+const cid = Math.random().toString(36).slice(2, 10);
 const btn = document.getElementById('btn');
 const label = document.getElementById('label');
 const hint = document.getElementById('hint');
+let mode = 'toggle', muted = true, holding = false, beatTimer = null, reqId = 0, counter = 0;
 
-function render(muted) {
+function stamp() { return Date.now() * 100 + (counter++ % 100); }
+
+function render() {
   btn.classList.toggle('muted', muted);
   btn.textContent = muted ? '🔇' : '🎙️';
-  label.textContent = muted ? 'Microfone MUTADO' : 'Microfone LIGADO';
-  hint.textContent = muted ? 'Toque para desmutar' : 'Toque para mutar';
+  if (mode === 'ptt') {
+    label.textContent = muted ? 'Segure para falar' : 'FALANDO…';
+    hint.textContent = muted ? 'Microfone fechado' : 'Solte para fechar';
+  } else {
+    label.textContent = muted ? 'Microfone MUTADO' : 'Microfone LIGADO';
+    hint.textContent = muted ? 'Toque para desmutar' : 'Toque para mutar';
+  }
 }
+function apply(d) { muted = d.muted; mode = d.mode || 'toggle'; render(); }
+
 async function call(path, method) {
-  const r = await fetch(path + '?t=' + encodeURIComponent(token), { method });
+  const sep = path.includes('?') ? '&' : '?';
+  const r = await fetch(path + sep + 't=' + encodeURIComponent(token), { method });
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }
 async function refresh() {
-  try { render((await call('/api/state', 'GET')).muted); }
+  if (holding) return;
+  try { apply(await call('/api/state', 'GET')); }
   catch (e) { label.textContent = 'Sem conexão com o PC'; hint.textContent = 'Confira o Wi-Fi e escaneie o QR de novo'; }
 }
+async function talk(on) {
+  const id = ++reqId;
+  try {
+    const d = await call('/api/talk?on=' + (on ? 1 : 0) + '&cid=' + cid + '&seq=' + stamp(), 'POST');
+    if (id === reqId) apply(d);
+  } catch (e) {}
+}
+
+function startHold(e) {
+  if (mode !== 'ptt' || holding) return;
+  e.preventDefault();
+  holding = true;
+  if (btn.setPointerCapture) { try { btn.setPointerCapture(e.pointerId); } catch (err) {} }
+  if (navigator.vibrate) navigator.vibrate(25);
+  talk(true);
+  beatTimer = setInterval(() => talk(true), 400);
+}
+function endHold() {
+  if (!holding) return;
+  holding = false;
+  clearInterval(beatTimer);
+  beatTimer = null;
+  talk(false);
+}
+btn.addEventListener('pointerdown', startHold);
+btn.addEventListener('pointerup', endHold);
+btn.addEventListener('pointercancel', endHold);
+btn.addEventListener('lostpointercapture', endHold);
+btn.addEventListener('contextmenu', (e) => e.preventDefault());
+window.addEventListener('blur', endHold);
+document.addEventListener('visibilitychange', () => { if (document.hidden) endHold(); });
+
 btn.addEventListener('click', async () => {
+  if (mode === 'ptt') return;
   if (navigator.vibrate) navigator.vibrate(30);
-  try { render((await call('/api/toggle', 'POST')).muted); } catch (e) { refresh(); }
+  try { apply(await call('/api/toggle', 'POST')); } catch (e) { refresh(); }
 });
 refresh();
 setInterval(refresh, 2000);
@@ -417,6 +643,7 @@ def make_handler(ctrl):
                 return self._send(405, '{"error":"metodo"}')
             if not self._authorized():
                 return self._send(403, '{"error":"token invalido"}')
+            query = parse_qs(urlparse(self.path).query)
             try:
                 if path == "/api/toggle":
                     muted = ctrl.toggle()
@@ -424,9 +651,19 @@ def make_handler(ctrl):
                     muted = ctrl.set_muted(True)
                 elif path == "/api/unmute":
                     muted = ctrl.set_muted(False)
+                elif path == "/api/talk":
+                    on = (query.get("on") or ["0"])[0] == "1"
+                    client = (query.get("cid") or [None])[0]
+                    if client is not None:
+                        client = client[:40]
+                    try:
+                        seq = int((query.get("seq") or [""])[0])
+                    except ValueError:
+                        seq = None
+                    muted = ctrl.remote_talk(on, client, seq)
                 else:
                     muted = ctrl.is_muted()
-                self._send(200, json.dumps({"muted": muted}))
+                self._send(200, json.dumps({"muted": muted, "mode": ctrl.get_mode()}))
             except Exception as exc:
                 self._send(500, json.dumps({"error": str(exc)}))
 
@@ -435,6 +672,7 @@ def make_handler(ctrl):
             "/api/toggle": "POST",
             "/api/mute": "POST",
             "/api/unmute": "POST",
+            "/api/talk": "POST",
         }
 
         def do_GET(self):
@@ -859,6 +1097,7 @@ class Tray:
             menu = pystray.Menu(
                 pystray.MenuItem("Abrir Mutinho", lambda icon, item: self.ctrl.events.put(("show", None)),
                                  default=True),
+                pystray.MenuItem("Tela cheia", lambda icon, item: self.ctrl.events.put(("fullscreen", None))),
                 pystray.MenuItem(lambda item: "Desmutar" if self.muted else "Mutar",
                                  lambda icon, item: self.ctrl.safe_toggle()),
                 pystray.MenuItem("Sair", lambda icon, item: self.ctrl.events.put(("quit", None))),
@@ -900,11 +1139,19 @@ class GUI:
     MUTE = "#ef4444"
     ACCENT = "#3b82f6"
 
-    def __init__(self, ctrl, server, hotkeys, start_hidden=False):
+    # nome: (tamanho em pontos, negrito). Todas escalam juntas na tela cheia.
+    FONT_SPECS = {
+        "h8": (8, False), "h9": (9, False), "h9b": (9, True), "h10b": (10, True),
+        "h11b": (11, True), "h13b": (13, True), "h15b": (15, True), "h54": (54, False),
+    }
+
+    def __init__(self, ctrl, server, hotkeys, ptt, start_hidden=False, start_fullscreen=False):
         import tkinter as tk
+        import tkinter.font as tkfont
 
         self.tk = tk
-        self.ctrl, self.server, self.hotkeys = ctrl, server, hotkeys
+        self.tkfont = tkfont
+        self.ctrl, self.server, self.hotkeys, self.ptt = ctrl, server, hotkeys, ptt
         self.cfg = ctrl.cfg
         self.muted = False
         self.recording = False
@@ -912,6 +1159,9 @@ class GUI:
         self.tray = None
         self.update_info = None
         self.updating = False
+        self.fullscreen = False
+        self.scale = 1.0
+        self.holding = False
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
@@ -919,7 +1169,10 @@ class GUI:
         self.root.resizable(False, False)
         self.root.attributes("-topmost", bool(self.cfg["on_top"]))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<F11>", lambda e: self._toggle_fullscreen())
+        self.root.bind("<Escape>", lambda e: self._exit_fullscreen())
 
+        self._make_fonts()
         self._build()
 
         # A bandeja não é usada no macOS (conflita com o tkinter)
@@ -935,19 +1188,23 @@ class GUI:
         if self.cfg["indicator"]:
             self._set_indicator(True)
 
+        hidden = False
         if self.tray is not None:
             self._say("Fechar a janela mantém o Mutinho na bandeja. Para sair, use o ícone perto do relógio.")
             if start_hidden or self.cfg["start_hidden"]:
                 self.root.withdraw()
+                hidden = True
         else:
             self._say("Bandeja indisponível (instale pystray e pillow). Fechar a janela encerra o app.")
+        if start_fullscreen and not hidden:
+            self.root.after(300, self._enter_fullscreen)
 
     # ---- construção -------------------------------------------------------
     def _button(self, parent, text, command, bg=None):
         tk = self.tk
         bg = bg or self.ACCENT
         lbl = tk.Label(parent, text=text, bg=bg, fg="white", padx=14, pady=6,
-                       font=("Helvetica", 10, "bold"), cursor="hand2")
+                       font=self.fonts["h10b"], cursor="hand2")
         lbl.bind("<Button-1>", lambda e: command())
         return lbl
 
@@ -959,50 +1216,70 @@ class GUI:
 
     def _build(self):
         tk = self.tk
-        root = self.root
-        left = tk.Frame(root, bg=self.BG)          # coluna da esquerda: controle principal
-        left.pack(side="left", anchor="n")
-        right = tk.Frame(root, bg=self.BG)         # coluna da direita: redução de ruído
-        right.pack(side="left", anchor="n", pady=(44, 0), padx=(0, 6))
-        root = left
+        self.container = tk.Frame(self.root, bg=self.BG)
+        self.container.pack(expand=True, padx=16, pady=10)
+        self.panelA = tk.Frame(self.container, bg=self.BG)   # controle principal
+        self.panelB = tk.Frame(self.container, bg=self.BG)   # opções e celular
+        self.panelC = tk.Frame(self.container, bg=self.BG)   # redução de ruído
+        self.msg = tk.Label(self.container, text="", bg=self.BG, fg=self.DIM,
+                            font=self.fonts["h9"], wraplength=340)
 
-        self.header = tk.Label(root, text=f"MUTINHO  v{APP_VERSION}", bg=self.BG, fg=self.DIM,
-                               font=("Helvetica", 11, "bold"))
-        self.header.pack(pady=(16, 6))
+        # ===== painel A: controle principal =====
+        A = self.panelA
+        self.top = tk.Frame(A, bg=self.BG)
+        self.top.pack(fill="x", padx=18, pady=(16, 6))
+        self.header = tk.Label(self.top, text=f"MUTINHO  v{APP_VERSION}", bg=self.BG, fg=self.DIM,
+                               font=self.fonts["h11b"])
+        self.header.pack(side="left")
+        self.fs_btn = self._button(self.top, "Tela cheia (F11)", self._toggle_fullscreen, bg="#4b5563")
+        self.fs_btn.pack(side="right", padx=(16, 0))
 
         # aviso de atualização (só aparece quando há versão nova)
-        self.update_bar = tk.Frame(root, bg="#14301f", padx=12, pady=8)
+        self.update_bar = tk.Frame(A, bg="#14301f", padx=12, pady=8)
         self.update_text = tk.Label(self.update_bar, text="", bg="#14301f", fg=self.FG,
-                                    font=("Helvetica", 9, "bold"))
+                                    font=self.fonts["h9b"])
         self.update_text.pack(side="left", padx=(0, 10))
         self.update_btn = self._button(self.update_bar, "Atualizar agora", self._do_update,
                                        bg=self.LIVE)
         self.update_btn.pack(side="right")
 
-        self.circle = tk.Canvas(root, width=160, height=160, bg=self.BG,
+        self.circle = tk.Canvas(A, width=160, height=160, bg=self.BG,
                                 highlightthickness=0, cursor="hand2")
         self.circle.pack()
         self.circle_shape = self.circle.create_oval(10, 10, 150, 150, fill=self.LIVE, outline="")
-        self.circle_icon = self.circle.create_text(80, 80, text="🎙", font=("Helvetica", 54), fill="white")
-        self.circle.bind("<Button-1>", lambda e: self._click_toggle())
+        self.circle_icon = self.circle.create_text(80, 80, text="🎙", font=self.fonts["h54"], fill="white")
+        self.circle.bind("<ButtonPress-1>", self._circle_press)
+        self.circle.bind("<ButtonRelease-1>", self._circle_release)
 
-        self.status = tk.Label(root, text="", bg=self.BG, fg=self.FG, font=("Helvetica", 15, "bold"))
-        self.status.pack(pady=(8, 14))
+        self.status = tk.Label(A, text="", bg=self.BG, fg=self.FG, font=self.fonts["h15b"])
+        self.status.pack(pady=(8, 10))
 
-        # Atalho
-        card = self._card(root)
-        tk.Label(card, text="Atalho global", bg=self.CARD, fg=self.DIM,
-                 font=("Helvetica", 9)).pack(anchor="w")
+        # seletor de modo
+        seg = tk.Frame(A, bg=self.CARD, padx=3, pady=3)
+        seg.pack(pady=(0, 12))
+        self.mode_btns = {}
+        for key, text in (("toggle", "Alternar"), ("ptt", "Apertar para falar")):
+            lbl = tk.Label(seg, text=text, padx=14, pady=6, font=self.fonts["h10b"], cursor="hand2")
+            lbl.bind("<Button-1>", lambda e, k=key: self._set_mode(k))
+            lbl.pack(side="left")
+            self.mode_btns[key] = lbl
+        self._style_mode()
+
+        # atalho (do modo atual)
+        card = self._card(A)
+        self.hotkey_title = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, font=self.fonts["h9"])
+        self.hotkey_title.pack(anchor="w")
         row = tk.Frame(card, bg=self.CARD)
         row.pack(fill="x", pady=(4, 0))
-        self.hotkey_label = tk.Label(row, text=pretty_combo(self.cfg["hotkey"]), bg=self.CARD,
-                                     fg=self.FG, font=("Helvetica", 13, "bold"))
+        self.hotkey_label = tk.Label(row, text="", bg=self.CARD, fg=self.FG, font=self.fonts["h13b"])
         self.hotkey_label.pack(side="left")
         self.record_btn = self._button(row, "Alterar", self._start_recording)
         self.record_btn.pack(side="right")
+        self._update_hotkey_label()
 
-        # Opções
-        card = self._card(root)
+        # ===== painel B: opções e celular =====
+        B = self.panelB
+        card = self._card(B)
         self.var_sound = tk.BooleanVar(value=bool(self.cfg["sound"]))
         self.var_top = tk.BooleanVar(value=bool(self.cfg["on_top"]))
         self.var_ind = tk.BooleanVar(value=bool(self.cfg["indicator"]))
@@ -1017,28 +1294,26 @@ class GUI:
                            selectcolor=self.BG, activebackground=self.CARD, activeforeground=self.FG,
                            highlightthickness=0, bd=0, anchor="w").pack(fill="x")
 
-        # Celular
-        card = self._card(root)
+        card = self._card(B)
         tk.Label(card, text="Controle pelo celular", bg=self.CARD, fg=self.DIM,
-                 font=("Helvetica", 9)).pack(anchor="w")
+                 font=self.fonts["h9"]).pack(anchor="w")
         self.qr_canvas = tk.Canvas(card, bg="white", highlightthickness=0)
         self.qr_canvas.pack(pady=(8, 6))
         self.url_label = tk.Label(card, text="", bg=self.CARD, fg=self.DIM,
-                                  font=("Helvetica", 8), wraplength=300)
+                                  font=self.fonts["h8"], wraplength=300)
         self.url_label.pack()
         tk.Label(card, text="Celular e PC precisam estar no mesmo Wi-Fi.", bg=self.CARD, fg=self.DIM,
-                 font=("Helvetica", 8)).pack(pady=(2, 8))
+                 font=self.fonts["h8"]).pack(pady=(2, 8))
         btns = tk.Frame(card, bg=self.CARD)
         btns.pack()
         self._button(btns, "Copiar link", self._copy_url).pack(side="left", padx=4)
         self._button(btns, "Gerar novo link", self._new_link, bg="#4b5563").pack(side="left", padx=4)
         self._draw_qr()
 
-        self.msg = tk.Label(root, text="", bg=self.BG, fg=self.DIM, font=("Helvetica", 9),
-                            wraplength=340)
-        self.msg.pack(pady=(0, 12))
+        # ===== painel C: redução de ruído =====
+        self._build_noise(self.panelC)
 
-        self._build_noise(right)
+        self._layout(False)
 
     # ---- QR ---------------------------------------------------------------
     def _draw_qr(self):
@@ -1049,7 +1324,7 @@ class GUI:
         qr.add_data(url)
         qr.make(fit=True)
         matrix = qr.get_matrix()
-        cell = max(2, 200 // len(matrix))
+        cell = max(2, self.S(200) // len(matrix))
         size = cell * len(matrix)
         self.qr_canvas.delete("all")
         self.qr_canvas.configure(width=size, height=size)
@@ -1077,6 +1352,169 @@ class GUI:
     def _click_toggle(self):
         threading.Thread(target=self.ctrl.safe_toggle, daemon=True).start()
 
+    # ---- botão do círculo, modo e atalho ----------------------------------
+    def _circle_press(self, event):
+        if self.ctrl.get_mode() == "ptt":
+            self.holding = True
+            self.ctrl.talk_async(True)
+        else:
+            self._click_toggle()
+
+    def _circle_release(self, event):
+        if self.holding:
+            self.holding = False
+            self.ctrl.talk_async(False)
+
+    def _style_mode(self):
+        current = self.ctrl.get_mode()
+        for key, lbl in self.mode_btns.items():
+            on = key == current
+            lbl.configure(bg=self.ACCENT if on else self.CARD, fg="white" if on else self.DIM)
+
+    def _set_mode(self, mode):
+        if mode == self.ctrl.get_mode():
+            return
+
+        def work():
+            try:
+                self.ctrl.set_mode(mode)
+            except Exception as exc:
+                self.ctrl.events.put(("msg", f"Erro ao trocar de modo: {exc}"))
+            else:
+                self.ctrl.events.put(("mode", None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_mode_changed(self):
+        try:
+            activate_hotkeys(self.cfg, self.hotkeys, self.ptt)
+        except Exception as exc:
+            self._say(f"Atalho indisponível: {exc}")
+        else:
+            if self.ctrl.get_mode() == "ptt":
+                self._say(f"Segure {pretty_combo(self.cfg['ptt_hotkey'])} (ou o círculo) para falar.")
+            else:
+                self._say("Modo alternar: o atalho liga e desliga o microfone.")
+        self._style_mode()
+        self._update_hotkey_label()
+        self.refresh()
+
+    def _update_hotkey_label(self):
+        ptt = self.cfg["mode"] == "ptt"
+        self.hotkey_title.configure(text="Tecla para falar (segure)" if ptt else "Atalho global")
+        self.hotkey_label.configure(text=pretty_combo(self.cfg["ptt_hotkey" if ptt else "hotkey"]))
+
+    # ---- fontes, escala e tela cheia ---------------------------------------
+    def _make_fonts(self):
+        tkfont = self.tkfont
+        self.fonts = {}
+        for name, (size, bold) in self.FONT_SPECS.items():
+            self.fonts[name] = tkfont.Font(root=self.root, family="Helvetica", size=size,
+                                           weight="bold" if bold else "normal")
+        # fontes padrão do Tk (caixas de seleção, menus) também precisam escalar
+        self.default_fonts = []
+        for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            try:
+                f = tkfont.nametofont(fname)
+                self.default_fonts.append((f, abs(int(f.cget("size"))) or 9))
+            except Exception:
+                pass
+
+    def S(self, n):
+        return int(round(n * self.scale))
+
+    def _set_scale(self, scale):
+        self.scale = scale
+        for name, (size, _bold) in self.FONT_SPECS.items():
+            self.fonts[name].configure(size=max(6, round(size * scale)))
+        for f, base in self.default_fonts:
+            f.configure(size=max(6, round(base * scale)))
+        self._apply_sizes()
+
+    def _apply_sizes(self):
+        S = self.S
+        size = S(160)
+        self.circle.configure(width=size, height=size)
+        self.circle.coords(self.circle_shape, S(10), S(10), size - S(10), size - S(10))
+        self.circle.coords(self.circle_icon, size // 2, size // 2)
+        self.url_label.configure(wraplength=S(300))
+        self.msg.configure(wraplength=S(900) if self.fullscreen else 340)
+        self._draw_qr()
+        if hasattr(self, "ns_scale"):
+            self.ns_scale.configure(length=S(290), sliderlength=S(22), width=S(14))
+            self.ns_meter.configure(width=S(290), height=S(36))
+            self.ns_status.configure(wraplength=S(290))
+            self.ns_help.configure(wraplength=S(290))
+
+    def _layout(self, full):
+        S = self.S
+        for w in (self.panelA, self.panelB, self.panelC, self.msg):
+            w.grid_forget()
+        for col in range(3):
+            self.container.grid_columnconfigure(col, minsize=0)
+        if full:
+            # três colunas lado a lado, ocupando a tela
+            self.panelA.grid(row=0, column=0, sticky="n", padx=S(8))
+            self.panelB.grid(row=0, column=1, sticky="n", padx=S(8))
+            self.panelC.grid(row=0, column=2, sticky="n", padx=S(8))
+            self.msg.grid(row=1, column=0, columnspan=3, pady=(S(8), 0))
+            for col in range(3):
+                self.container.grid_columnconfigure(col, minsize=S(340))
+        else:
+            self.panelA.grid(row=0, column=0, sticky="n")
+            self.panelB.grid(row=1, column=0, sticky="n")
+            self.panelC.grid(row=0, column=1, rowspan=2, sticky="n", pady=(44, 0), padx=(0, 6))
+            self.msg.grid(row=2, column=0, columnspan=2, pady=(0, 12))
+            self.container.grid_columnconfigure(0, minsize=340)
+
+    def _fit_to_screen(self):
+        """Escolhe o maior zoom (1x a 2,2x) em que as três colunas cabem na tela."""
+        root = self.root
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        self._set_scale(1.0)
+        root.update_idletasks()
+        w = max(1, self.container.winfo_reqwidth())
+        h = max(1, self.container.winfo_reqheight())
+        scale = max(1.0, min(2.2, sw * 0.94 / w, sh * 0.94 / h))
+        for _ in range(8):
+            self._set_scale(scale)
+            root.update_idletasks()
+            fits = (self.container.winfo_reqwidth() <= sw * 0.97
+                    and self.container.winfo_reqheight() <= sh * 0.97)
+            if fits or scale <= 1.0:
+                break
+            scale = max(1.0, scale * 0.92)
+
+    def _toggle_fullscreen(self):
+        if self.fullscreen:
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen()
+
+    def _enter_fullscreen(self):
+        if self.fullscreen:
+            return
+        self.fullscreen = True
+        self.root.deiconify()
+        self.root.resizable(True, True)
+        self.root.attributes("-fullscreen", True)
+        self._layout(True)
+        self._fit_to_screen()
+        self.fs_btn.configure(text="Sair da tela cheia (Esc)")
+        self.root.lift()
+        self.root.focus_force()
+
+    def _exit_fullscreen(self):
+        if not self.fullscreen:
+            return
+        self.fullscreen = False
+        self.root.attributes("-fullscreen", False)
+        self._set_scale(1.0)
+        self._layout(False)
+        self.fs_btn.configure(text="Tela cheia (F11)")
+        self.root.resizable(False, False)
+        self.root.geometry("")
+
     def refresh(self):
         try:
             self.muted = self.ctrl.is_muted()
@@ -1085,10 +1523,13 @@ class GUI:
             return
         self.ctrl.last_muted = self.muted
         color = self.MUTE if self.muted else self.LIVE
+        if self.ctrl.get_mode() == "ptt":
+            text = "Segure para falar" if self.muted else "FALANDO…"
+        else:
+            text = "Microfone MUTADO" if self.muted else "Microfone LIGADO"
         self.circle.itemconfigure(self.circle_shape, fill=color)
         self.circle.itemconfigure(self.circle_icon, text="🔇" if self.muted else "🎙")
-        self.status.configure(text="Microfone MUTADO" if self.muted else "Microfone LIGADO",
-                              fg=color)
+        self.status.configure(text=text, fg=color)
         if self.indicator is not None:
             self.indicator_label.configure(
                 text="● MUTADO" if self.muted else "● MIC LIGADO", fg=color)
@@ -1114,6 +1555,11 @@ class GUI:
                 elif kind == "quit":
                     self.quit()
                     return
+                elif kind == "mode":
+                    self._on_mode_changed()
+                elif kind == "fullscreen":
+                    self.show()
+                    self._enter_fullscreen()
                 elif kind == "update":
                     self._show_update(payload)
                 elif kind == "update_progress":
@@ -1154,17 +1600,20 @@ class GUI:
     def _apply_hotkey(self, combo):
         self.recording = False
         self.record_btn.configure(text="Alterar")
+        key = "ptt_hotkey" if self.cfg["mode"] == "ptt" else "hotkey"
+        previous = self.cfg[key]
+        self.cfg[key] = combo
         try:
-            self.hotkeys.start(combo)
-            self.cfg["hotkey"] = combo
+            activate_hotkeys(self.cfg, self.hotkeys, self.ptt)
             self._say("Atalho atualizado.")
         except Exception as exc:
+            self.cfg[key] = previous
             self._say(f"Atalho inválido ({exc}). Mantido o anterior.")
             try:
-                self.hotkeys.start(self.cfg["hotkey"])
+                activate_hotkeys(self.cfg, self.hotkeys, self.ptt)
             except Exception:
                 pass
-        self.hotkey_label.configure(text=pretty_combo(self.cfg["hotkey"]))
+        self._update_hotkey_label()
 
     # ---- opções -----------------------------------------------------------
     def _opt_sound(self):
@@ -1192,7 +1641,7 @@ class GUI:
             x = self.root.winfo_screenwidth() - width - 20
             win.geometry(f"{width}x{height}+{x}+20")
             self.indicator_label = tk.Label(win, text="", bg="#000000", fg=self.LIVE,
-                                            font=("Helvetica", 10, "bold"))
+                                            font=self.fonts["h10b"])
             self.indicator_label.pack(expand=True, fill="both")
             self.indicator = win
             self.refresh()
@@ -1217,7 +1666,7 @@ class GUI:
         self.update_info = info
         self.update_text.configure(text=f"Nova versão {info['version']} disponível")
         self.update_btn.configure(text="Atualizar agora" if can_self_update() else "Baixar no site")
-        self.update_bar.pack(after=self.header, fill="x", padx=18, pady=(0, 6))
+        self.update_bar.pack(after=self.top, fill="x", padx=18, pady=(0, 6))
         notes = info.get("notes")
         if notes:
             self._say(f"Novidades: {notes}")
@@ -1255,7 +1704,7 @@ class GUI:
         self.ns = NoiseSuppressor(self.ctrl)
         card = self._card(parent)
         tk.Label(card, text="Redução de ruído", bg=self.CARD, fg=self.DIM,
-                 font=("Helvetica", 9)).pack(anchor="w")
+                 font=self.fonts["h9"]).pack(anchor="w")
 
         ok, _err = NoiseSuppressor.available()
         if not ok:
@@ -1263,7 +1712,7 @@ class GUI:
                                 "python -m pip install numpy sounddevice\n\n"
                                 "e abra o Mutinho de novo.",
                      bg=self.CARD, fg=self.DIM, justify="left", wraplength=290,
-                     font=("Helvetica", 9)).pack(anchor="w", pady=(8, 0))
+                     font=self.fonts["h9"]).pack(anchor="w", pady=(8, 0))
             return
 
         self.var_ns = tk.BooleanVar(value=False)
@@ -1273,7 +1722,7 @@ class GUI:
                        highlightthickness=0, bd=0, anchor="w").pack(fill="x", pady=(6, 0))
 
         self.ns_label = tk.Label(card, text="", bg=self.CARD, fg=self.FG,
-                                 font=("Helvetica", 10, "bold"))
+                                 font=self.fonts["h10b"])
         self.ns_label.pack(anchor="w", pady=(8, 0))
         self.ns_scale = tk.Scale(card, from_=0, to=100, orient="horizontal", showvalue=False,
                                  length=290, command=self._ns_intensity, bg=self.CARD, fg=self.FG,
@@ -1284,18 +1733,18 @@ class GUI:
         self.ns_scale.pack(fill="x")
         ends = tk.Frame(card, bg=self.CARD)
         ends.pack(fill="x")
-        tk.Label(ends, text="Leve", bg=self.CARD, fg=self.DIM, font=("Helvetica", 8)).pack(side="left")
-        tk.Label(ends, text="Forte", bg=self.CARD, fg=self.DIM, font=("Helvetica", 8)).pack(side="right")
+        tk.Label(ends, text="Leve", bg=self.CARD, fg=self.DIM, font=self.fonts["h8"]).pack(side="left")
+        tk.Label(ends, text="Forte", bg=self.CARD, fg=self.DIM, font=self.fonts["h8"]).pack(side="right")
 
         tk.Label(card, text="Seu microfone", bg=self.CARD, fg=self.DIM,
-                 font=("Helvetica", 9)).pack(anchor="w", pady=(10, 2))
+                 font=self.fonts["h9"]).pack(anchor="w", pady=(10, 2))
         self.ns_in = tk.StringVar()
         self.ns_in_menu = tk.OptionMenu(card, self.ns_in, "")
         self._style_menu(self.ns_in_menu)
         self.ns_in_menu.pack(fill="x")
 
         tk.Label(card, text="Enviar o áudio limpo para (microfone virtual)", bg=self.CARD, fg=self.DIM,
-                 font=("Helvetica", 9)).pack(anchor="w", pady=(10, 2))
+                 font=self.fonts["h9"]).pack(anchor="w", pady=(10, 2))
         self.ns_out = tk.StringVar()
         self.ns_out_menu = tk.OptionMenu(card, self.ns_out, "")
         self._style_menu(self.ns_out_menu)
@@ -1305,10 +1754,10 @@ class GUI:
         self.ns_meter.pack(pady=(12, 0))
 
         self.ns_status = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=290,
-                                  justify="left", font=("Helvetica", 9, "bold"))
+                                  justify="left", font=self.fonts["h9b"])
         self.ns_status.pack(anchor="w", pady=(6, 0))
         self.ns_help = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=290,
-                                justify="left", font=("Helvetica", 8))
+                                justify="left", font=self.fonts["h8"])
         self.ns_help.pack(anchor="w", pady=(4, 8))
         self._button(card, "Atualizar dispositivos", self._ns_refresh_devices,
                      bg="#4b5563").pack(anchor="w")
@@ -1388,17 +1837,20 @@ class GUI:
     def _ns_meter(self):
         import math
 
+        S = self.S
         canvas = self.ns_meter
         canvas.delete("all")
+        width = S(290)
         rows = (("Entrada", self.ns.in_level, "#6b7280"), ("Saída", self.ns.out_level, self.LIVE))
         for i, (label, level, color) in enumerate(rows):
-            y = 4 + i * 16
+            y = S(4) + i * S(16)
             frac = 0.0
             if self.ns.running:
                 frac = min(1.0, max(0.0, (20 * math.log10(max(level, 1e-5)) + 60) / 60))
-            canvas.create_text(0, y + 5, text=label, anchor="w", fill=self.DIM, font=("Helvetica", 8))
-            canvas.create_rectangle(52, y, 290, y + 10, fill=self.BG, outline="")
-            canvas.create_rectangle(52, y, 52 + int(238 * frac), y + 10, fill=color, outline="")
+            canvas.create_text(0, y + S(5), text=label, anchor="w", fill=self.DIM, font=self.fonts["h8"])
+            canvas.create_rectangle(S(52), y, width, y + S(10), fill=self.BG, outline="")
+            canvas.create_rectangle(S(52), y, S(52) + int((width - S(52)) * frac), y + S(10),
+                                    fill=color, outline="")
         self.root.after(100, self._ns_meter)
 
     def show(self):
@@ -1408,6 +1860,8 @@ class GUI:
 
     def on_close(self):
         """Botão X: esconde na bandeja (se houver) em vez de encerrar."""
+        if self.fullscreen:
+            self._exit_fullscreen()
         if self.tray is not None:
             self.root.withdraw()
         else:
@@ -1419,7 +1873,9 @@ class GUI:
         if self.tray is not None:
             self.tray.stop()
         self.hotkeys.stop()
+        self.ptt.stop()
         self.server.stop()
+        self.ctrl.shutdown()
         self.root.destroy()
 
     def run(self):
@@ -1434,22 +1890,27 @@ def main():
     cfg = Config()
     backend = make_backend(cfg, fake="--fake" in args)
     ctrl = Controller(cfg, backend)
+    ctrl.apply_startup()
 
     server = RemoteServer(ctrl)
     server.start()
 
     hotkeys = HotkeyManager(ctrl.safe_toggle)
+    ptt = PushToTalk(ctrl.talk_async)
     hotkey_error = None
     try:
-        hotkeys.start(cfg["hotkey"])
+        activate_hotkeys(cfg, hotkeys, ptt)
     except Exception as exc:
         hotkey_error = str(exc)
 
     if "--no-gui" in args:
         import qrcode
 
+        is_ptt = cfg["mode"] == "ptt"
         print(f"{APP_NAME} rodando.")
-        print(f"Atalho: {pretty_combo(cfg['hotkey'])}" + (f"  (indisponível: {hotkey_error})" if hotkey_error else ""))
+        print(f"Modo: {'apertar para falar' if is_ptt else 'alternar'}")
+        print(f"Atalho: {pretty_combo(cfg['ptt_hotkey' if is_ptt else 'hotkey'])}"
+              + (f"  (indisponível: {hotkey_error})" if hotkey_error else ""))
         print(f"Link do celular: {server.url()}\n")
         qr = qrcode.QRCode(border=1)
         qr.add_data(server.url())
@@ -1459,9 +1920,11 @@ def main():
             threading.Event().wait()
         except KeyboardInterrupt:
             pass
+        ctrl.shutdown()
         return
 
-    gui = GUI(ctrl, server, hotkeys, start_hidden="--hidden" in args)
+    gui = GUI(ctrl, server, hotkeys, ptt, start_hidden="--hidden" in args,
+              start_fullscreen="--fullscreen" in args)
     if hotkey_error:
         gui._say(f"Atalho global indisponível: {hotkey_error}")
     gui.run()
