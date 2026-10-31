@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Mutinho - muta o microfone com um atalho global e permite mutar/desmutar
 pelo celular lendo um QR code (sem instalar nada no celular).
@@ -32,6 +31,7 @@ DEFAULTS = {
     "sound": True,
     "on_top": False,
     "indicator": False,
+    "start_hidden": False,
     "mac_prev_volume": 70,
 }
 
@@ -482,6 +482,69 @@ def local_ip():
 
 
 # --------------------------------------------------------------------------
+# Ícone na bandeja do sistema (perto do relógio)
+# --------------------------------------------------------------------------
+class Tray:
+    """Ícone na bandeja com menu. Se pystray/Pillow faltarem, start() devolve False."""
+
+    def __init__(self, ctrl):
+        self.ctrl = ctrl
+        self.icon = None
+        self.muted = False
+
+    @staticmethod
+    def _image(muted):
+        from PIL import Image, ImageDraw
+
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((2, 2, size - 2, size - 2), fill="#ef4444" if muted else "#22c55e")
+        d.rounded_rectangle((25, 13, 39, 36), radius=7, fill="white")        # corpo do microfone
+        d.arc((19, 24, 45, 46), start=0, end=180, fill="white", width=3)      # haste
+        d.line((32, 46, 32, 52), fill="white", width=3)
+        d.line((25, 52, 39, 52), fill="white", width=3)
+        if muted:
+            d.line((14, 50, 50, 14), fill="white", width=5)                   # risco de mudo
+        return img
+
+    def start(self):
+        try:
+            import pystray
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Abrir Mutinho", lambda icon, item: self.ctrl.events.put(("show", None)),
+                                 default=True),
+                pystray.MenuItem(lambda item: "Desmutar" if self.muted else "Mutar",
+                                 lambda icon, item: self.ctrl.safe_toggle()),
+                pystray.MenuItem("Sair", lambda icon, item: self.ctrl.events.put(("quit", None))),
+            )
+            self.icon = pystray.Icon(APP_NAME, self._image(False), f"{APP_NAME} - microfone ligado", menu)
+            self.icon.run_detached()
+            return True
+        except Exception:
+            self.icon = None
+            return False
+
+    def update(self, muted):
+        self.muted = muted
+        if self.icon is not None:
+            try:
+                self.icon.icon = self._image(muted)
+                self.icon.title = f"{APP_NAME} - " + ("MUTADO" if muted else "microfone ligado")
+            except Exception:
+                pass
+
+    def stop(self):
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+            self.icon = None
+
+
+# --------------------------------------------------------------------------
 # Interface gráfica (tkinter)
 # --------------------------------------------------------------------------
 class GUI:
@@ -493,7 +556,7 @@ class GUI:
     MUTE = "#ef4444"
     ACCENT = "#3b82f6"
 
-    def __init__(self, ctrl, server, hotkeys):
+    def __init__(self, ctrl, server, hotkeys, start_hidden=False):
         import tkinter as tk
 
         self.tk = tk
@@ -502,20 +565,35 @@ class GUI:
         self.muted = False
         self.recording = False
         self.indicator = None
+        self.tray = None
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.configure(bg=self.BG)
         self.root.resizable(False, False)
         self.root.attributes("-topmost", bool(self.cfg["on_top"]))
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build()
+
+        # A bandeja não é usada no macOS (conflita com o tkinter)
+        if SYSTEM != "Darwin":
+            tray = Tray(ctrl)
+            if tray.start():
+                self.tray = tray
+
         self.refresh()
         self.root.after(100, self._pump_events)
         self.root.after(1500, self._poll_state)
         if self.cfg["indicator"]:
             self._set_indicator(True)
+
+        if self.tray is not None:
+            self._say("Fechar a janela mantém o Mutinho na bandeja. Para sair, use o ícone perto do relógio.")
+            if start_hidden or self.cfg["start_hidden"]:
+                self.root.withdraw()
+        else:
+            self._say("Bandeja indisponível (instale pystray e pillow). Fechar a janela encerra o app.")
 
     # ---- construção -------------------------------------------------------
     def _button(self, parent, text, command, bg=None):
@@ -566,10 +644,12 @@ class GUI:
         self.var_sound = tk.BooleanVar(value=bool(self.cfg["sound"]))
         self.var_top = tk.BooleanVar(value=bool(self.cfg["on_top"]))
         self.var_ind = tk.BooleanVar(value=bool(self.cfg["indicator"]))
+        self.var_hidden = tk.BooleanVar(value=bool(self.cfg["start_hidden"]))
         for text, var, cmd in (
             ("Som ao mutar/desmutar", self.var_sound, self._opt_sound),
             ("Manter janela sempre no topo", self.var_top, self._opt_top),
             ("Indicador flutuante na tela", self.var_ind, self._opt_indicator),
+            ("Iniciar escondido na bandeja", self.var_hidden, self._opt_hidden),
         ):
             tk.Checkbutton(card, text=text, variable=var, command=cmd, bg=self.CARD, fg=self.FG,
                            selectcolor=self.BG, activebackground=self.CARD, activeforeground=self.FG,
@@ -647,6 +727,8 @@ class GUI:
         if self.indicator is not None:
             self.indicator_label.configure(
                 text="● MUTADO" if self.muted else "● MIC LIGADO", fg=color)
+        if self.tray is not None:
+            self.tray.update(self.muted)
 
     def _poll_state(self):
         self.refresh()
@@ -662,6 +744,11 @@ class GUI:
                     self._say(payload)
                 elif kind == "hotkey":
                     self._apply_hotkey(payload)
+                elif kind == "show":
+                    self.show()
+                elif kind == "quit":
+                    self.quit()
+                    return
         except queue.Empty:
             pass
         self.root.after(100, self._pump_events)
@@ -702,6 +789,9 @@ class GUI:
         self.cfg["on_top"] = bool(self.var_top.get())
         self.root.attributes("-topmost", bool(self.var_top.get()))
 
+    def _opt_hidden(self):
+        self.cfg["start_hidden"] = bool(self.var_hidden.get())
+
     def _opt_indicator(self):
         self.cfg["indicator"] = bool(self.var_ind.get())
         self._set_indicator(bool(self.var_ind.get()))
@@ -726,7 +816,21 @@ class GUI:
             self.indicator = None
 
     # ---- ciclo de vida ----------------------------------------------------
-    def close(self):
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def on_close(self):
+        """Botão X: esconde na bandeja (se houver) em vez de encerrar."""
+        if self.tray is not None:
+            self.root.withdraw()
+        else:
+            self.quit()
+
+    def quit(self):
+        if self.tray is not None:
+            self.tray.stop()
         self.hotkeys.stop()
         self.server.stop()
         self.root.destroy()
@@ -770,7 +874,7 @@ def main():
             pass
         return
 
-    gui = GUI(ctrl, server, hotkeys)
+    gui = GUI(ctrl, server, hotkeys, start_hidden="--hidden" in args)
     if hotkey_error:
         gui._say(f"Atalho global indisponível: {hotkey_error}")
     gui.run()

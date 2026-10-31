@@ -1,4 +1,6 @@
 pynput>=1.7.6
 qrcode>=7.4
+pystray>=0.19.5
+pillow>=10.0
 pycaw; sys_platform == "win32"
 comtypes; sys_platform == "win32"
