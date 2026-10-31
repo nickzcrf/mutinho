@@ -1,0 +1,4 @@
+pynput>=1.7.6
+qrcode>=7.4
+pycaw; sys_platform == "win32"
+comtypes; sys_platform == "win32"

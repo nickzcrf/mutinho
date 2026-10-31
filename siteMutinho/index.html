@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#14161a">
+<title>Mutinho — mute seu microfone com um atalho</title>
+<meta name="description" content="Muta o microfone com um atalho global no Windows e desmuta pelo celular lendo um QR code. Grátis.">
+<style>
+  :root {
+    --bg:#101215; --card:#1a1d23; --line:#2a2e36; --fg:#eceef1; --dim:#9aa0aa;
+    --live:#22c55e; --mute:#ef4444; --accent:#3b82f6;
+  }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body { margin:0; background:var(--bg); color:var(--fg); line-height:1.55;
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color:inherit; }
+  .wrap { width:min(1040px, 100% - 40px); margin:0 auto; }
+
+  nav { display:flex; align-items:center; justify-content:space-between; padding:22px 0; }
+  .logo { font-weight:800; letter-spacing:.14em; font-size:14px; color:var(--dim); }
+  nav a.link { color:var(--dim); text-decoration:none; font-size:14px; }
+  nav a.link:hover { color:var(--fg); }
+
+  .hero { display:grid; grid-template-columns:1.1fr .9fr; gap:48px; align-items:center; padding:36px 0 72px; }
+  h1 { font-size:clamp(34px, 5.4vw, 58px); line-height:1.06; margin:0 0 18px; letter-spacing:-.02em; }
+  h1 em { font-style:normal; color:var(--live); }
+  .lead { font-size:19px; color:var(--dim); max-width:34ch; margin:0 0 30px; }
+  .btn { display:inline-flex; align-items:center; gap:10px; background:var(--live); color:#06210f; font-weight:700;
+         font-size:17px; padding:15px 26px; border-radius:12px; text-decoration:none; transition:transform .12s, filter .12s; }
+  .btn:hover { filter:brightness(1.08); transform:translateY(-1px); }
+  .btn:active { transform:translateY(0); }
+  .meta { margin:14px 0 0; font-size:13px; color:var(--dim); }
+
+  .stage { position:relative; display:flex; justify-content:center; align-items:center; min-height:380px; }
+  .app { width:250px; background:var(--card); border:1px solid var(--line); border-radius:18px;
+         padding:22px 20px 20px; text-align:center; box-shadow:0 30px 60px -30px rgba(0,0,0,.7); }
+  .app-title { font-size:11px; letter-spacing:.18em; font-weight:700; color:var(--dim); margin-bottom:14px; }
+  .orb { width:132px; height:132px; border-radius:50%; border:0; cursor:pointer; font-size:52px; color:#fff;
+         background:var(--live); box-shadow:0 0 0 10px rgba(34,197,94,.16); transition:all .18s; }
+  .orb:focus-visible { outline:3px solid var(--accent); outline-offset:4px; }
+  .muted .orb, .orb.muted { background:var(--mute); box-shadow:0 0 0 10px rgba(239,68,68,.16); }
+  .state { margin:16px 0 10px; font-weight:700; font-size:16px; color:var(--live); }
+  .muted .state { color:var(--mute); }
+  .chip { display:inline-block; font-size:12px; color:var(--dim); border:1px solid var(--line); border-radius:999px; padding:4px 12px; }
+  .try { position:absolute; bottom:0; font-size:12px; color:var(--dim); }
+
+  .phone { position:absolute; right:-6px; bottom:34px; width:112px; height:210px; background:#0b0c0f; border:2px solid #343943;
+           border-radius:22px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px;
+           box-shadow:0 20px 40px -20px rgba(0,0,0,.8); transform:rotate(6deg); }
+  .phone .mini { width:62px; height:62px; border-radius:50%; background:var(--live); font-size:26px; display:grid; place-items:center;
+                 box-shadow:0 0 0 6px rgba(34,197,94,.16); transition:all .18s; }
+  .muted .phone .mini { background:var(--mute); box-shadow:0 0 0 6px rgba(239,68,68,.16); }
+  .phone small { font-size:9px; color:var(--dim); letter-spacing:.1em; }
+
+  section { padding:56px 0; border-top:1px solid var(--line); }
+  h2 { font-size:28px; margin:0 0 28px; letter-spacing:-.01em; }
+  .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:24px; }
+  .card h3 { margin:0 0 8px; font-size:18px; }
+  .card p { margin:0; color:var(--dim); font-size:15px; }
+  .num { display:grid; place-items:center; width:34px; height:34px; border-radius:50%; background:var(--live); color:#06210f;
+         font-weight:800; margin-bottom:14px; }
+  kbd { background:#262a32; border:1px solid #3a3f49; border-bottom-width:2px; border-radius:6px; padding:1px 7px; font-size:.9em; }
+
+  details { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; margin-bottom:10px; }
+  summary { cursor:pointer; font-weight:600; }
+  details p { color:var(--dim); margin:10px 0 0; font-size:15px; }
+
+  .cta { text-align:center; }
+  .cta h2 { margin-bottom:20px; }
+  footer { border-top:1px solid var(--line); padding:26px 0 40px; color:var(--dim); font-size:13px; text-align:center; }
+
+  @media (max-width: 820px) {
+    .hero { grid-template-columns:1fr; gap:24px; padding-top:12px; }
+    .stage { min-height:340px; }
+    .grid { grid-template-columns:1fr; }
+    .phone { right:4px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; scroll-behavior:auto !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <span class="logo">MUTINHO</span>
+    <a class="link" href="#como-usar">Como usar</a>
+  </nav>
+
+  <header class="hero">
+    <div>
+      <h1>Muta o microfone com <em>um atalho</em>.</h1>
+      <p class="lead">Desmuta pelo celular, lendo um QR code. Sem cadastro, sem instalar app no celular.</p>
+      <a class="btn" href="Mutinho.exe" download>⬇ Baixar para Windows</a>
+      <p class="meta">Grátis · Windows 10 e 11 · arquivo único, sem instalador</p>
+    </div>
+
+    <div class="stage" id="stage">
+      <div class="app">
+        <div class="app-title">MUTINHO</div>
+        <button class="orb" id="orb" aria-label="Alternar a demonstração entre mutado e ligado">🎙️</button>
+        <div class="state" id="state">Microfone LIGADO</div>
+        <span class="chip">Ctrl + Alt + M</span>
+      </div>
+      <div class="phone" aria-hidden="true">
+        <div class="mini" id="mini">🎙️</div>
+        <small>CELULAR</small>
+      </div>
+      <span class="try">↑ clique no círculo para testar</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>Feito para uma coisa só</h2>
+    <div class="grid">
+      <div class="card"><h3>Atalho global</h3><p>Muta e desmuta de qualquer programa: Meet, Discord, Zoom, jogos. Você escolhe a combinação de teclas.</p></div>
+      <div class="card"><h3>Controle pelo celular</h3><p>Escaneie o QR da janela e use um botão grande no celular. Funciona no mesmo Wi-Fi, sem instalar nada.</p></div>
+      <div class="card"><h3>Sempre à vista</h3><p>Indicador flutuante na tela e som ao mutar, para você nunca falar achando que estava ligado.</p></div>
+    </div>
+  </section>
+
+  <section id="como-usar">
+    <h2>Como usar</h2>
+    <div class="grid">
+      <div class="card"><div class="num">1</div><h3>Baixe e abra</h3><p>Dê um duplo clique no <strong>Mutinho.exe</strong>. Se o Windows avisar "protegeu seu PC", clique em <strong>Mais informações</strong> e depois em <strong>Executar assim mesmo</strong>.</p></div>
+      <div class="card"><div class="num">2</div><h3>Libere a rede</h3><p>Quando o firewall perguntar, marque <strong>Redes privadas</strong> e permita. É isso que deixa o celular conectar.</p></div>
+      <div class="card"><div class="num">3</div><h3>Mute e desmute</h3><p>Use <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>M</kbd> no PC ou aponte a câmera do celular para o QR da janela.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Dúvidas</h2>
+    <details><summary>Por que o Windows mostra um aviso?</summary><p>O app é de um desenvolvedor independente e não tem assinatura digital paga, então o Windows desconfia de qualquer arquivo novo. Alguns antivírus também reclamam de programas empacotados em Python. É um alerta genérico.</p></details>
+    <details><summary>O app grava ou envia meu áudio?</summary><p>Não. Ele só liga e desliga o mudo do microfone do Windows. O controle pelo celular conversa apenas com o seu PC, dentro da sua rede local, por um link com um código secreto que você pode trocar quando quiser.</p></details>
+    <details><summary>Tem para Mac ou Linux?</summary><p>Este download é só para Windows.</p></details>
+    <details><summary>O celular não abre a página. E agora?</summary><p>Confira se os dois estão no mesmo Wi-Fi (rede de visitantes costuma isolar os aparelhos) e se o firewall do Windows permitiu o app em redes privadas.</p></details>
+    <details><summary>Preciso deixar a janela aberta?</summary><p>Sim, pode minimizar. Se fechar a janela, o atalho e o celular param de funcionar.</p></details>
+  </section>
+
+  <section class="cta">
+    <h2>Pronto para nunca mais falar mutado?</h2>
+    <a class="btn" href="Mutinho.exe" download>⬇ Baixar Mutinho</a>
+  </section>
+
+  <footer>Mutinho · feito por Nicolas</footer>
+</div>
+
+<script>
+  var stage = document.getElementById('stage');
+  var orb = document.getElementById('orb');
+  var state = document.getElementById('state');
+  var mini = document.getElementById('mini');
+  var muted = false;
+  function render() {
+    stage.classList.toggle('muted', muted);
+    orb.textContent = muted ? '🔇' : '🎙️';
+    mini.textContent = muted ? '🔇' : '🎙️';
+    state.textContent = muted ? 'Microfone MUTADO' : 'Microfone LIGADO';
+  }
+  orb.addEventListener('click', function () { muted = !muted; render(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.ctrlKey && e.altKey && (e.key === 'm' || e.key === 'M')) { muted = !muted; render(); }
+  });
+</script>
+</body>
+</html>
