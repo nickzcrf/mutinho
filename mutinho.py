@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 # Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
 # Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
 UPDATE_URL = "https://mutinho.vercel.app/version.json"
@@ -44,6 +44,7 @@ DEFAULTS = {
     "start_hidden": False,
     "mode": "toggle",          # "toggle" (alternar) ou "ptt" (apertar para falar)
     "ptt_hotkey": "<f9>",
+    "talk_muted": True,  # no modo alternar, segurar a tecla/botão fala sem desmutar de vez
     "ns_enabled": False,
     "ns_intensity": 60,
     "ns_in": "",
@@ -68,6 +69,9 @@ class Config:
 
     def __getitem__(self, key):
         return self.data[key]
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
 
     def __setitem__(self, key, value):
         self.data[key] = value
@@ -201,6 +205,7 @@ def play_sound(kind):
     threading.Thread(target=_play, daemon=True).start()
 
 
+TAP_SECONDS = 0.30  # no círculo, apertar e soltar antes disso conta como toque (desmutar)
 REMOTE_HOLD_TIMEOUT = 1.5  # segundos sem sinal do celular com o botão apertado => fecha o microfone
 
 
@@ -216,6 +221,7 @@ class Controller:
         self._beat = None        # instante do último sinal do celular segurando o botão
         self._watch_thread = None
         self._seqs = {}          # último número de pedido recebido de cada celular
+        self._temp = False       # microfone aberto só enquanto se segura (estando mutado)
 
     # ---- estado básico ----
     def get_mode(self):
@@ -227,6 +233,7 @@ class Controller:
 
     def set_muted(self, muted, sound=True):
         with self.lock:
+            self._temp = False
             self.backend.set_muted(muted)
             state = self.backend.is_muted()
         self.last_muted = state
@@ -237,7 +244,20 @@ class Controller:
 
     def toggle(self):
         with self.lock:
+            if self._temp:
+                # apertou o atalho segurando a tecla de falar: deixa aberto de vez
+                self._temp = False
+                return self.set_muted(False)
             return self.set_muted(not self.backend.is_muted())
+
+    def is_temp(self):
+        return self._temp
+
+    def release_temp(self):
+        """Fecha o microfone se ele estava aberto só por estar segurando a tecla."""
+        with self.lock:
+            if self._temp:
+                self.set_muted(True, sound=False)
 
     def safe_toggle(self):
         try:
@@ -249,6 +269,7 @@ class Controller:
     def set_mode(self, mode):
         mode = "ptt" if mode == "ptt" else "toggle"
         self.cfg["mode"] = mode
+        self._temp = False
         if mode == "ptt":
             self.set_muted(True, sound=False)  # em apertar para falar o microfone fica fechado
         self.events.put(("refresh", None))
@@ -265,7 +286,7 @@ class Controller:
     def shutdown(self):
         """Ao sair, não deixa o microfone aberto no modo apertar para falar."""
         self._beat = None
-        if self.get_mode() == "ptt":
+        if self.get_mode() == "ptt" or self._temp:
             try:
                 self.set_muted(True, sound=False)
             except Exception:
@@ -273,13 +294,29 @@ class Controller:
 
     # ---- apertar para falar ----
     def talk(self, on):
-        """Microfone aberto enquanto 'on' for verdadeiro (só vale no modo apertar para falar)."""
+        """Microfone aberto enquanto 'on' for verdadeiro.
+        Modo apertar para falar: sempre. Modo alternar: só estando mutado (e com a opção ligada);
+        ao soltar, volta a mutar."""
         if self.get_mode() != "ptt":
-            return self.is_muted()
+            return self._hold_while_muted(on)
         with self.lock:
             if self.backend.is_muted() == (not on):
                 return not on  # já está no estado pedido
         return self.set_muted(not on)
+
+    def _hold_while_muted(self, on):
+        if not self.cfg.get("talk_muted", True):
+            return self.is_muted()
+        with self.lock:
+            if on:
+                if self._temp or not self.backend.is_muted():
+                    return self.backend.is_muted()
+                state = self.set_muted(False, sound=False)
+                self._temp = True  # set_muted zera a marca; só vale depois de abrir
+                return state
+            if not self._temp:
+                return self.backend.is_muted()
+            return self.set_muted(True, sound=False)
 
     def talk_async(self, on):
         """Para ganchos de teclado: não bloqueia e mantém a ordem dos eventos."""
@@ -433,6 +470,8 @@ def activate_hotkeys(cfg, toggle_mgr, ptt_mgr):
         ptt_mgr.start(cfg["ptt_hotkey"])
     else:
         toggle_mgr.start(cfg["hotkey"])
+        if cfg.get("talk_muted", True) and cfg["ptt_hotkey"] != cfg["hotkey"]:
+            ptt_mgr.start(cfg["ptt_hotkey"])  # segurar para falar enquanto estiver mutado
 
 
 def record_hotkey(on_done):
@@ -533,6 +572,10 @@ PAGE = """<!doctype html>
   #btn:active { transform:scale(.96); }
   #label { font-size:22px; font-weight:600; text-align:center; }
   #hint { font-size:14px; color:var(--dim); text-align:center; min-height:18px; }
+  #hold { width:min(72vw, 300px); padding:16px; border-radius:16px; border:2px solid #3a3f49; background:#1e2127;
+          color:var(--fg); font-size:18px; font-weight:600; touch-action:none; -webkit-touch-callout:none; }
+  #hold.on { background:var(--live); border-color:var(--live); color:#06210f; }
+  #hold[hidden] { display:none; }
 </style>
 </head>
 <body>
@@ -540,13 +583,15 @@ PAGE = """<!doctype html>
   <button id="btn" aria-label="Botão do microfone">🎙️</button>
   <div id="label">Conectando…</div>
   <div id="hint"></div>
+  <button id="hold" hidden>🎤 Segure para falar</button>
 <script>
 const token = new URLSearchParams(location.search).get('t') || '';
 const cid = Math.random().toString(36).slice(2, 10);
 const btn = document.getElementById('btn');
 const label = document.getElementById('label');
 const hint = document.getElementById('hint');
-let mode = 'toggle', muted = true, holding = false, beatTimer = null, reqId = 0, counter = 0;
+const hold = document.getElementById('hold');
+let mode = 'toggle', muted = true, temp = false, talkMuted = true, holding = false, beatTimer = null, reqId = 0, counter = 0;
 
 function stamp() { return Date.now() * 100 + (counter++ % 100); }
 
@@ -556,12 +601,20 @@ function render() {
   if (mode === 'ptt') {
     label.textContent = muted ? 'Segure para falar' : 'FALANDO…';
     hint.textContent = muted ? 'Microfone fechado' : 'Solte para fechar';
+  } else if (temp) {
+    label.textContent = 'FALANDO…';
+    hint.textContent = 'Solte para mutar de novo';
   } else {
     label.textContent = muted ? 'Microfone MUTADO' : 'Microfone LIGADO';
     hint.textContent = muted ? 'Toque para desmutar' : 'Toque para mutar';
   }
+  hold.hidden = !(mode === 'toggle' && talkMuted && (muted || temp));
+  hold.classList.toggle('on', temp);
 }
-function apply(d) { muted = d.muted; mode = d.mode || 'toggle'; render(); }
+function apply(d) {
+  muted = d.muted; mode = d.mode || 'toggle'; temp = !!d.temp;
+  talkMuted = d.talk_muted !== false; render();
+}
 
 async function call(path, method) {
   const sep = path.includes('?') ? '&' : '?';
@@ -583,7 +636,9 @@ async function talk(on) {
 }
 
 function startHold(e) {
-  if (mode !== 'ptt' || holding) return;
+  if (holding) return;
+  if (mode === 'toggle' && !(talkMuted && muted)) return;
+  if (mode === 'toggle' && e.currentTarget === btn) return;
   e.preventDefault();
   holding = true;
   if (btn.setPointerCapture) { try { btn.setPointerCapture(e.pointerId); } catch (err) {} }
@@ -598,11 +653,13 @@ function endHold() {
   beatTimer = null;
   talk(false);
 }
-btn.addEventListener('pointerdown', startHold);
-btn.addEventListener('pointerup', endHold);
-btn.addEventListener('pointercancel', endHold);
-btn.addEventListener('lostpointercapture', endHold);
-btn.addEventListener('contextmenu', (e) => e.preventDefault());
+for (const el of [btn, hold]) {
+  el.addEventListener('pointerdown', startHold);
+  el.addEventListener('pointerup', endHold);
+  el.addEventListener('pointercancel', endHold);
+  el.addEventListener('lostpointercapture', endHold);
+  el.addEventListener('contextmenu', (e) => e.preventDefault());
+}
 window.addEventListener('blur', endHold);
 document.addEventListener('visibilitychange', () => { if (document.hidden) endHold(); });
 
@@ -663,7 +720,9 @@ def make_handler(ctrl):
                     muted = ctrl.remote_talk(on, client, seq)
                 else:
                     muted = ctrl.is_muted()
-                self._send(200, json.dumps({"muted": muted, "mode": ctrl.get_mode()}))
+                self._send(200, json.dumps({
+                    "muted": muted, "mode": ctrl.get_mode(), "temp": ctrl.is_temp(),
+                    "talk_muted": bool(ctrl.cfg.get("talk_muted", True))}))
             except Exception as exc:
                 self._send(500, json.dumps({"error": str(exc)}))
 
@@ -1162,18 +1221,26 @@ class GUI:
         self.fullscreen = False
         self.scale = 1.0
         self.holding = False
+        self.hold_t0 = 0.0
+        self.maxed = False          # janela maximizada (botão quadrado): usa o layout grande
+        self._maxed_size = None
+        self._was_zoomed = False
+        self._cfg_job = None
+        self.rec_key = "hotkey"
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.configure(bg=self.BG)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.root.attributes("-topmost", bool(self.cfg["on_top"]))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<F11>", lambda e: self._toggle_fullscreen())
         self.root.bind("<Escape>", lambda e: self._exit_fullscreen())
+        self.root.bind("<Configure>", self._on_configure)
 
         self._make_fonts()
         self._build()
+        self._set_normal_size(force=True)
 
         # A bandeja não é usada no macOS (conflita com o tkinter)
         if SYSTEM != "Darwin":
@@ -1217,7 +1284,7 @@ class GUI:
     def _build(self):
         tk = self.tk
         self.container = tk.Frame(self.root, bg=self.BG)
-        self.container.pack(expand=True, padx=16, pady=10)
+        self.container.place(relx=0.5, rely=0.5, anchor="center")
         self.panelA = tk.Frame(self.container, bg=self.BG)   # controle principal
         self.panelB = tk.Frame(self.container, bg=self.BG)   # opções e celular
         self.panelC = tk.Frame(self.container, bg=self.BG)   # redução de ruído
@@ -1273,8 +1340,20 @@ class GUI:
         row.pack(fill="x", pady=(4, 0))
         self.hotkey_label = tk.Label(row, text="", bg=self.CARD, fg=self.FG, font=self.fonts["h13b"])
         self.hotkey_label.pack(side="left")
-        self.record_btn = self._button(row, "Alterar", self._start_recording)
+        self.record_btn = self._button(row, "Alterar", lambda: self._start_recording("main"))
         self.record_btn.pack(side="right")
+
+        # segunda tecla: falar segurando enquanto estiver mutado (só no modo alternar)
+        self.hold_box = tk.Frame(card, bg=self.CARD)
+        self.hold_title = tk.Label(self.hold_box, text="Falar enquanto mutado (segure)", bg=self.CARD,
+                                   fg=self.DIM, font=self.fonts["h9"])
+        self.hold_title.pack(anchor="w", pady=(10, 0))
+        hrow = tk.Frame(self.hold_box, bg=self.CARD)
+        hrow.pack(fill="x", pady=(4, 0))
+        self.hold_label = tk.Label(hrow, text="", bg=self.CARD, fg=self.FG, font=self.fonts["h13b"])
+        self.hold_label.pack(side="left")
+        self.hold_btn = self._button(hrow, "Alterar", lambda: self._start_recording("hold"))
+        self.hold_btn.pack(side="right")
         self._update_hotkey_label()
 
         # ===== painel B: opções e celular =====
@@ -1284,7 +1363,9 @@ class GUI:
         self.var_top = tk.BooleanVar(value=bool(self.cfg["on_top"]))
         self.var_ind = tk.BooleanVar(value=bool(self.cfg["indicator"]))
         self.var_hidden = tk.BooleanVar(value=bool(self.cfg["start_hidden"]))
+        self.var_talkm = tk.BooleanVar(value=bool(self.cfg.get("talk_muted", True)))
         for text, var, cmd in (
+            ("Segurar para falar estando mutado", self.var_talkm, self._opt_talk_muted),
             ("Som ao mutar/desmutar", self.var_sound, self._opt_sound),
             ("Manter janela sempre no topo", self.var_top, self._opt_top),
             ("Indicador flutuante na tela", self.var_ind, self._opt_indicator),
@@ -1354,15 +1435,22 @@ class GUI:
 
     # ---- botão do círculo, modo e atalho ----------------------------------
     def _circle_press(self, event):
-        if self.ctrl.get_mode() == "ptt":
+        mode = self.ctrl.get_mode()
+        if mode == "ptt" or (self.muted and self.cfg.get("talk_muted", True)):
+            # segurar fala; no modo alternar, um toque rápido desmuta de vez
             self.holding = True
+            self.hold_t0 = time.monotonic()
             self.ctrl.talk_async(True)
         else:
             self._click_toggle()
 
     def _circle_release(self, event):
-        if self.holding:
-            self.holding = False
+        if not self.holding:
+            return
+        self.holding = False
+        if self.ctrl.get_mode() != "ptt" and time.monotonic() - self.hold_t0 < TAP_SECONDS:
+            self._click_toggle()  # toque rápido = desmutar (a marca de "só segurando" cai)
+        else:
             self.ctrl.talk_async(False)
 
     def _style_mode(self):
@@ -1394,7 +1482,9 @@ class GUI:
             if self.ctrl.get_mode() == "ptt":
                 self._say(f"Segure {pretty_combo(self.cfg['ptt_hotkey'])} (ou o círculo) para falar.")
             else:
-                self._say("Modo alternar: o atalho liga e desliga o microfone.")
+                self._say("Modo alternar: o atalho liga e desliga o microfone."
+                          + (f" Mutado, segure {pretty_combo(self.cfg['ptt_hotkey'])} para falar."
+                             if self.cfg.get("talk_muted", True) else ""))
         self._style_mode()
         self._update_hotkey_label()
         self.refresh()
@@ -1403,6 +1493,12 @@ class GUI:
         ptt = self.cfg["mode"] == "ptt"
         self.hotkey_title.configure(text="Tecla para falar (segure)" if ptt else "Atalho global")
         self.hotkey_label.configure(text=pretty_combo(self.cfg["ptt_hotkey" if ptt else "hotkey"]))
+        self.hold_label.configure(text=pretty_combo(self.cfg["ptt_hotkey"]))
+        if not ptt and self.cfg.get("talk_muted", True):
+            self.hold_box.pack(fill="x")
+        else:
+            self.hold_box.pack_forget()
+        self._set_normal_size()
 
     # ---- fontes, escala e tela cheia ---------------------------------------
     def _make_fonts(self):
@@ -1467,23 +1563,82 @@ class GUI:
             self.msg.grid(row=2, column=0, columnspan=2, pady=(0, 12))
             self.container.grid_columnconfigure(0, minsize=340)
 
-    def _fit_to_screen(self):
-        """Escolhe o maior zoom (1x a 2,2x) em que as três colunas cabem na tela."""
+    def _fit_to_area(self, aw, ah):
+        """Escolhe o maior zoom (1x a 2,2x) em que as três colunas cabem na área dada."""
         root = self.root
-        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         self._set_scale(1.0)
         root.update_idletasks()
         w = max(1, self.container.winfo_reqwidth())
         h = max(1, self.container.winfo_reqheight())
-        scale = max(1.0, min(2.2, sw * 0.94 / w, sh * 0.94 / h))
+        scale = max(1.0, min(2.2, aw * 0.94 / w, ah * 0.94 / h))
         for _ in range(8):
             self._set_scale(scale)
             root.update_idletasks()
-            fits = (self.container.winfo_reqwidth() <= sw * 0.97
-                    and self.container.winfo_reqheight() <= sh * 0.97)
+            fits = (self.container.winfo_reqwidth() <= aw * 0.97
+                    and self.container.winfo_reqheight() <= ah * 0.97)
             if fits or scale <= 1.0:
                 break
             scale = max(1.0, scale * 0.92)
+
+    def _fit_to_screen(self):
+        self._fit_to_area(self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+
+    # ---- tamanho da janela e botão de maximizar -----------------------------
+    def _set_normal_size(self, force=False):
+        """Tamanho mínimo = o conteúdo. Com force, também volta ao tamanho natural."""
+        if self.fullscreen or self.maxed:
+            return
+        self.root.update_idletasks()
+        w = self.container.winfo_reqwidth() + 32
+        h = self.container.winfo_reqheight() + 20
+        self.root.minsize(w, h)
+        if force:
+            self.root.geometry(f"{w}x{h}")
+        else:
+            cw, ch = self.root.winfo_width(), self.root.winfo_height()
+            if cw > 1 and (cw < w or ch < h):
+                self.root.geometry(f"{max(cw, w)}x{max(ch, h)}")
+
+    def _is_maximized(self):
+        try:
+            if self.root.state() == "zoomed":  # Windows e macOS
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(self.root.attributes("-zoomed"))  # Linux (X11)
+        except Exception:
+            return False
+
+    def _on_configure(self, event):
+        if event.widget is not self.root or self.fullscreen:
+            return
+        if self._cfg_job is not None:
+            try:
+                self.root.after_cancel(self._cfg_job)
+            except Exception:
+                pass
+        self._cfg_job = self.root.after(120, self._sync_maximized)
+
+    def _sync_maximized(self):
+        """Maximizada: usa as três colunas e aumenta o zoom até ocupar a janela. Restaurada: volta ao normal."""
+        self._cfg_job = None
+        if self.fullscreen:
+            return
+        if self._is_maximized():
+            size = (self.root.winfo_width(), self.root.winfo_height())
+            if not self.maxed or size != self._maxed_size:
+                self.maxed = True
+                self._maxed_size = size
+                self.root.minsize(1, 1)
+                self._layout(True)
+                self._fit_to_area(*size)
+        elif self.maxed:
+            self.maxed = False
+            self._maxed_size = None
+            self._set_scale(1.0)
+            self._layout(False)
+            self._set_normal_size(force=True)
 
     def _toggle_fullscreen(self):
         if self.fullscreen:
@@ -1494,9 +1649,11 @@ class GUI:
     def _enter_fullscreen(self):
         if self.fullscreen:
             return
+        self._was_zoomed = self.maxed or self._is_maximized()
         self.fullscreen = True
+        self.maxed = False
         self.root.deiconify()
-        self.root.resizable(True, True)
+        self.root.minsize(1, 1)
         self.root.attributes("-fullscreen", True)
         self._layout(True)
         self._fit_to_screen()
@@ -1512,8 +1669,10 @@ class GUI:
         self._set_scale(1.0)
         self._layout(False)
         self.fs_btn.configure(text="Tela cheia (F11)")
-        self.root.resizable(False, False)
-        self.root.geometry("")
+        if self._was_zoomed:
+            self.root.after(250, self._sync_maximized)  # voltou maximizada: refaz o zoom
+        else:
+            self._set_normal_size(force=True)
 
     def refresh(self):
         try:
@@ -1585,22 +1744,30 @@ class GUI:
         self.root.after(100, self._pump_events)
 
     # ---- atalho -----------------------------------------------------------
-    def _start_recording(self):
+    def _start_recording(self, which="main"):
         if self.recording:
             return
+        ptt = self.cfg["mode"] == "ptt"
+        self.rec_key = "ptt_hotkey" if (ptt or which == "hold") else "hotkey"
+        self.rec_which = which
         try:
             record_hotkey(lambda combo: self.ctrl.events.put(("hotkey", combo)))
         except Exception as exc:
             self._say(f"Não foi possível gravar o atalho: {exc}")
             return
         self.recording = True
-        self.hotkey_label.configure(text="Pressione o novo atalho…")
-        self.record_btn.configure(text="Gravando…")
+        if which == "hold":
+            self.hold_label.configure(text="Pressione a nova tecla…")
+            self.hold_btn.configure(text="Gravando…")
+        else:
+            self.hotkey_label.configure(text="Pressione o novo atalho…")
+            self.record_btn.configure(text="Gravando…")
 
     def _apply_hotkey(self, combo):
         self.recording = False
         self.record_btn.configure(text="Alterar")
-        key = "ptt_hotkey" if self.cfg["mode"] == "ptt" else "hotkey"
+        self.hold_btn.configure(text="Alterar")
+        key = self.rec_key
         previous = self.cfg[key]
         self.cfg[key] = combo
         try:
@@ -1616,6 +1783,21 @@ class GUI:
         self._update_hotkey_label()
 
     # ---- opções -----------------------------------------------------------
+    def _opt_talk_muted(self):
+        self.cfg["talk_muted"] = bool(self.var_talkm.get())
+        if not self.cfg["talk_muted"]:
+            try:
+                self.ctrl.release_temp()  # não deixa o microfone aberto
+            except Exception:
+                pass
+        try:
+            activate_hotkeys(self.cfg, self.hotkeys, self.ptt)
+        except Exception as exc:
+            self._say(f"Atalho indisponível: {exc}")
+        self._update_hotkey_label()
+        self.refresh()
+        self.cfg.save()
+
     def _opt_sound(self):
         self.cfg["sound"] = bool(self.var_sound.get())
 

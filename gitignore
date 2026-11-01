@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+build/
+*.spec
+vbcable/
+Output/
+.venv/

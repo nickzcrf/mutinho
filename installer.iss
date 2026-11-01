@@ -4,7 +4,7 @@
 ;   vbcable\                          (conteúdo extraído do pacote do VB-CABLE, de vb-audio.com/Cable)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.0"
+  #define MyAppVersion "1.4.0"
 #endif
 #define MyAppName "Mutinho"
 #define MyAppExe "Mutinho.exe"
@@ -13,6 +13,11 @@
 AppId={{B7C3F2A1-5D4E-4F7A-9C1B-3E8A6D2F4B90}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoDescription=Instalador do {#MyAppName} {#MyAppVersion}
+DisableWelcomePage=no
 AppPublisher=Nicolas
 ; Instala na pasta do usuário: assim o app consegue se atualizar sozinho (não precisa de administrador)
 DefaultDirName={localappdata}\Programs\{#MyAppName}

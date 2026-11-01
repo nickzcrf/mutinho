@@ -60,7 +60,7 @@
   section { padding:56px 0; border-top:1px solid var(--line); }
   h2 { font-size:28px; margin:0 0 28px; letter-spacing:-.01em; }
   .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:18px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:24px; }
+  .card { min-width:0; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:24px; }
   .card h3 { margin:0 0 8px; font-size:18px; }
   .card p { margin:0; color:var(--dim); font-size:15px; }
   .num { display:grid; place-items:center; width:34px; height:34px; border-radius:50%; background:var(--live); color:#06210f;
@@ -71,6 +71,15 @@
   summary { cursor:pointer; font-weight:600; }
   details p { color:var(--dim); margin:10px 0 0; font-size:15px; }
 
+  .tabs { display:inline-flex; gap:4px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:4px; margin-bottom:22px; }
+  .tabs button { background:none; border:0; color:var(--dim); font:inherit; font-weight:600; padding:8px 18px; border-radius:9px; cursor:pointer; }
+  .tabs button[aria-selected="true"] { background:var(--live); color:#06210f; }
+  .tabs button:focus-visible { outline:2px solid var(--live); outline-offset:2px; }
+  .os[hidden] { display:none; }
+  .note { color:var(--dim); font-size:15px; margin:0 0 18px; max-width:760px; }
+  pre { background:#0f1114; border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:10px 0 0; overflow-x:auto; font-size:13px; }
+  code { font-family:ui-monospace, Consolas, monospace; }
+  .ver { font-weight:500; opacity:.75; margin-left:4px; }
   .cta { text-align:center; }
   .cta h2 { margin-bottom:20px; }
   footer { border-top:1px solid var(--line); padding:26px 0 40px; color:var(--dim); font-size:13px; text-align:center; }
@@ -95,8 +104,9 @@
     <div>
       <h1>Muta o microfone com <em>um atalho</em>.</h1>
       <p class="lead">Desmuta pelo celular com um QR code, reduz o ruído de fundo e se atualiza com um clique. Sem cadastro, sem app no celular.</p>
-      <a class="btn" href="dist/MutinhoSetup.exe" download>⬇ Baixar para Windows</a>
-      <p class="meta">Grátis · Windows 10 e 11 · instalador completo</p>
+      <a class="btn js-dl" href="dist/MutinhoSetup.exe" download>⬇ Baixar para Windows <span class="ver"></span></a>
+      <p class="meta">Grátis · Windows 10 e 11 · instalador completo <span class="ver-meta"></span></p>
+      <p class="meta"><a class="alt" href="#como-usar" data-os-link="mac">Usa Mac ou Linux? Veja como rodar</a></p>
       <p class="meta"><a class="alt" href="dist/Mutinho.exe" download>Prefere só o app, sem instalar o microfone virtual? Baixe o Mutinho.exe</a></p>
     </div>
 
@@ -123,16 +133,45 @@
       <div class="card"><h3>Sempre à vista</h3><p>Indicador flutuante na tela e som ao mutar, para você nunca falar achando que estava ligado.</p></div>
       <div class="card"><h3>Redução de ruído</h3><p>Diminui ventilador, ar-condicionado e chiado de fundo, com intensidade ajustável de 0 a 100%. Funciona nos seus apps de chamada pelo microfone virtual que vem no instalador.</p></div>
       <div class="card"><h3>Atualização com um clique</h3><p>Quando sai uma versão nova, o Mutinho avisa na própria janela. Um clique em "Atualizar agora" e ele baixa, confere o arquivo e reabre sozinho.</p></div>
+      <div class="card"><h3>Falar mesmo mutado</h3><p>Está mutado e precisa falar rapidinho? Segure uma tecla (F9), o círculo da janela ou o botão no celular: o microfone abre enquanto você segura e volta a mutar ao soltar.</p></div>
+      <div class="card"><h3>Apertar para falar</h3><p>Prefere o microfone sempre fechado? Troque para o modo "Apertar para falar" e só ele abre enquanto você segura a tecla ou o botão.</p></div>
+      <div class="card"><h3>Tela cheia</h3><p>Use F11 ou arraste a janela para maximizar: a interface cresce e mostra tudo lado a lado.</p></div>
       <div class="card"><h3>Discreto na bandeja</h3><p>Fechar a janela mantém o Mutinho rodando perto do relógio. Dá para iniciar junto com o Windows, já escondido.</p></div>
     </div>
   </section>
 
   <section id="como-usar">
     <h2>Como usar</h2>
-    <div class="grid">
-      <div class="card"><div class="num">1</div><h3>Baixe e instale</h3><p>Abra o <strong>MutinhoSetup.exe</strong>. Se o Windows avisar "protegeu seu PC", clique em <strong>Mais informações</strong> e depois em <strong>Executar assim mesmo</strong>. Deixe marcada a opção do microfone virtual se quiser a redução de ruído.</p></div>
-      <div class="card"><div class="num">2</div><h3>Aceite as permissões</h3><p>Se instalou o microfone virtual, aceite as janelas de permissão do Windows e reinicie o PC quando o instalador pedir. Quando o firewall perguntar, marque <strong>Redes privadas</strong>: é isso que deixa o celular conectar.</p></div>
-      <div class="card"><div class="num">3</div><h3>Mute e desmute</h3><p>Use <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>M</kbd> no PC ou aponte a câmera do celular para o QR da janela.</p></div>
+    <div class="tabs" role="tablist" aria-label="Sistema operacional">
+      <button role="tab" data-os="win" aria-selected="true">Windows</button>
+      <button role="tab" data-os="mac" aria-selected="false">macOS</button>
+      <button role="tab" data-os="linux" aria-selected="false">Linux</button>
+    </div>
+
+    <div class="os" data-panel="win">
+      <div class="grid">
+        <div class="card"><div class="num">1</div><h3>Baixe e instale</h3><p>Abra o <strong>MutinhoSetup.exe</strong>. Se o Windows avisar "protegeu seu PC", clique em <strong>Mais informações</strong> e depois em <strong>Executar assim mesmo</strong>. Deixe marcada a opção do microfone virtual se quiser a redução de ruído.</p></div>
+        <div class="card"><div class="num">2</div><h3>Aceite as permissões</h3><p>Se instalou o microfone virtual, aceite as janelas de permissão do Windows e reinicie o PC quando o instalador pedir. Quando o firewall perguntar, marque <strong>Redes privadas</strong>: é isso que deixa o celular conectar.</p></div>
+        <div class="card"><div class="num">3</div><h3>Mute e desmute</h3><p>Use <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>M</kbd> no PC, segure <kbd>F9</kbd> para falar mutado, ou aponte a câmera do celular para o QR da janela.</p></div>
+      </div>
+    </div>
+
+    <div class="os" data-panel="mac" hidden>
+      <p class="note">No Mac o Mutinho roda a partir do código-fonte (não há instalador). Foi pouco testado: a redução de ruído com microfone virtual é pensada para o Windows.</p>
+      <div class="grid">
+        <div class="card"><div class="num">1</div><h3>Instale o Python</h3><p>Com o <a class="alt" href="https://brew.sh">Homebrew</a>, no Terminal:</p><pre><code>brew install python python-tk</code></pre></div>
+        <div class="card"><div class="num">2</div><h3>Baixe e prepare</h3><p><a class="alt" href="https://github.com/nickzcrf/mutinho/archive/refs/heads/main.zip">Baixe o código</a>, extraia e, na pasta:</p><pre><code>pip3 install -r requirements.txt</code></pre></div>
+        <div class="card"><div class="num">3</div><h3>Abra o app</h3><pre><code>python3 mutinho.py</code></pre><p>Libere o Terminal em <strong>Ajustes › Privacidade › Acessibilidade</strong> e <strong>Monitoramento de entrada</strong> para o atalho global funcionar. Ele muta zerando o volume de entrada.</p></div>
+      </div>
+    </div>
+
+    <div class="os" data-panel="linux" hidden>
+      <p class="note">No Linux o Mutinho roda a partir do código-fonte. O atalho global precisa de sessão X11 (no Wayland ele pode não funcionar). Usa o PulseAudio/PipeWire (<code>pactl</code>) para mutar.</p>
+      <div class="grid">
+        <div class="card"><div class="num">1</div><h3>Instale as dependências</h3><p>No Debian/Ubuntu:</p><pre><code>sudo apt install python3 python3-pip python3-tk pulseaudio-utils</code></pre></div>
+        <div class="card"><div class="num">2</div><h3>Baixe e prepare</h3><p><a class="alt" href="https://github.com/nickzcrf/mutinho/archive/refs/heads/main.zip">Baixe o código</a>, extraia e, na pasta:</p><pre><code>pip3 install -r requirements.txt</code></pre></div>
+        <div class="card"><div class="num">3</div><h3>Abra o app</h3><pre><code>python3 mutinho.py</code></pre><p>Use o atalho no teclado ou escaneie o QR com o celular, no mesmo Wi-Fi.</p></div>
+      </div>
     </div>
   </section>
 
@@ -144,17 +183,19 @@
     <details><summary>A redução de ruído funciona em qualquer programa?</summary><p>Em qualquer programa que deixe escolher o microfone: nas configurações de áudio dele, selecione "CABLE Output". Ela diminui ruídos constantes, como ventilador, ar-condicionado e chiado. Ruídos que mudam rápido, como teclado e vozes ao fundo, passam em boa parte. Use fones de ouvido para evitar eco.</p></details>
     <details><summary>Como funcionam as atualizações?</summary><p>Ao abrir, o Mutinho confere se há versão nova. Se houver, aparece um aviso verde na janela com o botão "Atualizar agora": ele baixa, confere a integridade do arquivo e reabre sozinho. Funciona na versão instalada pelo instalador ou no Mutinho.exe, e só em pastas onde seu usuário pode gravar. Se você tem uma versão antiga, baixe uma vez de novo aqui no site; depois disso é automático.</p></details>
     <details><summary>Preciso reiniciar o PC?</summary><p>Só se você instalar o microfone virtual, porque o driver de áudio só aparece para os programas depois de reiniciar.</p></details>
-    <details><summary>Tem para Mac ou Linux?</summary><p>Este download é só para Windows.</p></details>
+    <details><summary>Tem para Mac ou Linux?</summary><p>Não há instalador, mas dá para rodar pelo código-fonte: escolha a aba macOS ou Linux em "Como usar". Essas versões foram pouco testadas, e a redução de ruído com microfone virtual é feita para o Windows.</p></details>
+    <details><summary>Como falo estando mutado?</summary><p>Segure <kbd>F9</kbd> (dá para trocar a tecla), o círculo da janela ou o botão "Segure para falar" que aparece no celular quando está mutado. O microfone abre enquanto você segura e volta a mutar ao soltar. Um toque rápido no círculo desmuta de vez. Dá para desligar isso nas opções da janela.</p></details>
+    <details><summary>Por que o botão de maximizar estava cinza?</summary><p>Nas versões antigas a janela tinha tamanho fixo. A partir da 1.4.0 ela pode ser maximizada e a interface se ajusta ao tamanho.</p></details>
     <details><summary>O celular não abre a página. E agora?</summary><p>Confira se os dois estão no mesmo Wi-Fi (rede de visitantes costuma isolar os aparelhos) e se o firewall do Windows permitiu o app em redes privadas.</p></details>
     <details><summary>Preciso deixar a janela aberta?</summary><p>Sim, pode minimizar. Se fechar a janela, o atalho e o celular param de funcionar.</p></details>
   </section>
 
   <section class="cta">
     <h2>Pronto para nunca mais falar mutado?</h2>
-    <a class="btn" href="dist/MutinhoSetup.exe" download>⬇ Baixar Mutinho</a>
+    <a class="btn js-dl" href="dist/MutinhoSetup.exe" download>⬇ Baixar Mutinho <span class="ver"></span></a>
   </section>
 
-  <footer>Mutinho · feito por Nicolas<br>O instalador inclui o VB-CABLE, microfone virtual criado pela VB-Audio Software (<a class="alt" href="https://vb-cable.com">vb-cable.com</a>). VB-CABLE é donationware: todas as contribuições são bem-vindas.</footer>
+  <footer>Mutinho · feito por Nicolas · <a class="alt" href="https://github.com/nickzcrf/mutinho">código no GitHub</a><br>O instalador inclui o VB-CABLE, microfone virtual criado pela VB-Audio Software (<a class="alt" href="https://vb-cable.com">vb-cable.com</a>). VB-CABLE é donationware: todas as contribuições são bem-vindas.</footer>
 </div>
 
 <script>
@@ -173,6 +214,31 @@
   document.addEventListener('keydown', function (e) {
     if (e.ctrlKey && e.altKey && (e.key === 'm' || e.key === 'M')) { muted = !muted; render(); }
   });
+
+  // versão atual no botão de download (lida do version.json) e nome do arquivo com a versão
+  fetch('version.json', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d || !/^[0-9][0-9A-Za-z.\-]*$/.test(d.version || '')) return;
+    document.querySelectorAll('.js-dl').forEach(function (a) { a.setAttribute('download', 'MutinhoSetup-' + d.version + '.exe'); });
+    document.querySelectorAll('.ver').forEach(function (el) { el.textContent = 'v' + d.version; });
+    document.querySelectorAll('.ver-meta').forEach(function (el) { el.textContent = '· versão ' + d.version; });
+  }).catch(function () {});
+
+  // abas Windows / macOS / Linux
+  var tabs = document.querySelectorAll('.tabs button');
+  function showOS(os) {
+    tabs.forEach(function (t) { t.setAttribute('aria-selected', String(t.dataset.os === os)); });
+    document.querySelectorAll('.os').forEach(function (p) { p.hidden = p.dataset.panel !== os; });
+    try { localStorage.setItem('mutinho-os', os); } catch (e) {}
+  }
+  tabs.forEach(function (t) { t.addEventListener('click', function () { showOS(t.dataset.os); }); });
+  document.querySelectorAll('[data-os-link]').forEach(function (a) {
+    a.addEventListener('click', function () { showOS(a.dataset.osLink); });
+  });
+  var saved = null;
+  try { saved = localStorage.getItem('mutinho-os'); } catch (e) {}
+  var ua = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
+  var guess = /mac/i.test(ua) ? 'mac' : /linux|x11/i.test(ua) && !/android/i.test(navigator.userAgent) ? 'linux' : 'win';
+  showOS(saved === 'win' || saved === 'mac' || saved === 'linux' ? saved : guess);
 </script>
 </body>
 </html>
