@@ -97,7 +97,7 @@ Para o instalador, coloque o conteúdo do pacote do VB-CABLE em `vbcable\` (baix
 
 O Mutinho não grava nem envia áudio. O controle pelo celular conversa só com o seu PC, na rede local.
 
-Na primeira abertura, o app envia **um único aviso anônimo** para contar instalações: um código aleatório, a versão e o sistema operacional (o IP não é gravado). Para desligar, desmarque **Contar esta instalação** nas opções da janela. O app também consulta `version.json` no site para checar atualizações.
+Na primeira abertura, o app envia **um único aviso anônimo** para contar instalações: um código aleatório, a versão e o sistema operacional (o IP não é gravado). Para não participar, coloque `"count_installs": false` no arquivo `.mutinho.json` da sua pasta de usuário antes da primeira abertura (ou rode o código-fonte sem acesso à internet). O app também consulta `version.json` no site para checar atualizações.
 
 ## Contagem de instalações (para quem publica o site)
 

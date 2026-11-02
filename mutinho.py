@@ -46,7 +46,7 @@ DEFAULTS = {
     "start_hidden": False,
     "mode": "toggle",          # "toggle" (alternar) ou "ptt" (apertar para falar)
     "ptt_hotkey": "<f9>",
-    "count_installs": True,   # avisa uma única vez, de forma anônima, que o app foi instalado
+    "count_installs": True,   # avisa uma única vez, de forma anônima, que o app foi instalado (false em ~/.mutinho.json desliga)
     "install_id": "",
     "counted": False,
     "talk_muted": True,  # no modo alternar, segurar a tecla/botão fala sem desmutar de vez
@@ -1517,7 +1517,6 @@ class GUI:
         self.var_ind = tk.BooleanVar(value=bool(self.cfg["indicator"]))
         self.var_hidden = tk.BooleanVar(value=bool(self.cfg["start_hidden"]))
         self.var_auto = tk.BooleanVar(value=autostart_enabled())
-        self.var_count = tk.BooleanVar(value=bool(self.cfg.get("count_installs", True)))
         self.var_talkm = tk.BooleanVar(value=bool(self.cfg.get("talk_muted", True)))
         for text, var, cmd in (
             ("Segurar para falar estando mutado", self.var_talkm, self._opt_talk_muted),
@@ -1526,7 +1525,6 @@ class GUI:
             ("Indicador flutuante na tela", self.var_ind, self._opt_indicator),
             ("Iniciar escondido na bandeja", self.var_hidden, self._opt_hidden),
             ("Iniciar junto com o computador", self.var_auto, self._opt_autostart),
-            ("Contar esta instalação (anônimo, uma vez)", self.var_count, self._opt_count),
         ):
             tk.Checkbutton(card, text=text, variable=var, command=cmd, bg=self.CARD, fg=self.FG,
                            selectcolor=self.BG, activebackground=self.CARD, activeforeground=self.FG,
@@ -1948,9 +1946,6 @@ class GUI:
         except Exception as exc:
             self._say(f"Não foi possível alterar o início com o computador: {exc}")
         self.var_auto.set(autostart_enabled())
-
-    def _opt_count(self):
-        self.cfg["count_installs"] = bool(self.var_count.get())
 
     def _opt_hidden(self):
         self.cfg["start_hidden"] = bool(self.var_hidden.get())
