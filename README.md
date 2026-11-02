@@ -13,6 +13,7 @@ Muta o microfone com um atalho global e desmuta pelo celular com um QR code. Gr�
 - **Redução de ruído** com intensidade de 0 a 100% (ventilador, ar-condicionado, chiado). Usa um microfone virtual (VB-CABLE, incluído no instalador do Windows).
 - **Tela cheia** (`F11`) e janela **maximizável**: a interface se adapta ao tamanho.
 - **Bandeja do sistema**, indicador flutuante, som ao mutar e início escondido.
+- **Iniciar com o computador**, escondido na bandeja (opção na janela ou no instalador).
 - **Atualização automática** com verificação SHA-256 (versão `.exe`/instalador no Windows).
 
 ## Instalação
@@ -95,6 +96,16 @@ Para o instalador, coloque o conteúdo do pacote do VB-CABLE em `vbcable\` (baix
 ## Privacidade
 
 O Mutinho não grava nem envia áudio. O controle pelo celular conversa só com o seu PC, na rede local.
+
+Na primeira abertura, o app envia **um único aviso anônimo** para contar instalações: um código aleatório, a versão e o sistema operacional (o IP não é gravado). Para desligar, desmarque **Contar esta instalação** nas opções da janela. O app também consulta `version.json` no site para checar atualizações.
+
+## Contagem de instalações (para quem publica o site)
+
+O site tem duas funções na Vercel (`siteMutinho/api`) e um painel em `/admin`, protegido por senha:
+
+1. Na Vercel, abra o projeto → **Storage** → crie um banco **Upstash Redis** (plano gratuito) e conecte ao projeto. Isso cria as variáveis `KV_REST_API_URL` e `KV_REST_API_TOKEN`.
+2. Em **Settings → Environment Variables**, crie `ADMIN_TOKEN` com uma senha longa (8+ caracteres).
+3. Faça um novo deploy (commit + push) e abra `https://SEU-SITE/admin`.
 
 ## Créditos e licenças
 

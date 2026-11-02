@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Mutinho · Painel</title>
+<style>
+  :root { --bg:#0e1013; --card:#1a1d22; --line:#2a2e36; --fg:#e8eaed; --dim:#9aa0a6; --live:#22c55e; --bad:#ef4444; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; padding:24px 16px; }
+  main { max-width:760px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 20px; letter-spacing:.04em; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:16px; }
+  .big { font-size:56px; font-weight:800; color:var(--live); line-height:1; }
+  .dim { color:var(--dim); font-size:14px; }
+  form { display:flex; gap:8px; flex-wrap:wrap; }
+  input { flex:1; min-width:200px; padding:12px; border-radius:10px; border:1px solid var(--line); background:#0f1114; color:var(--fg); font:inherit; }
+  button { padding:12px 20px; border:0; border-radius:10px; background:var(--live); color:#06210f; font:inherit; font-weight:700; cursor:pointer; }
+  table { width:100%; border-collapse:collapse; }
+  td { padding:6px 0; border-bottom:1px solid var(--line); }
+  td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  h2 { font-size:16px; margin:0 0 10px; color:var(--dim); font-weight:600; }
+  #err { color:var(--bad); min-height:22px; margin-top:8px; }
+  .bar { display:flex; align-items:flex-end; gap:3px; height:80px; margin-top:10px; }
+  .bar i { flex:1; background:var(--live); border-radius:3px 3px 0 0; min-height:2px; opacity:.85; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>MUTINHO · INSTALAÇÕES</h1>
+
+  <div class="card" id="login">
+    <form id="f">
+      <input id="pw" type="password" placeholder="Senha" autocomplete="current-password" required>
+      <button type="submit">Entrar</button>
+    </form>
+    <div id="err" role="alert"></div>
+  </div>
+
+  <div id="data" hidden>
+    <div class="card"><div class="big" id="total">0</div><div class="dim">instalações no total</div></div>
+    <div class="card"><h2>Últimos 30 dias</h2><div class="bar" id="bars"></div><div class="dim" id="range"></div></div>
+    <div class="card"><h2>Por versão</h2><table id="ver"></table></div>
+    <div class="card"><h2>Por sistema</h2><table id="os"></table></div>
+    <div class="dim"><a href="#" id="out" style="color:inherit">Sair</a></div>
+  </div>
+</main>
+<script>
+  var $ = function (id) { return document.getElementById(id); };
+  function rows(el, obj) {
+    el.textContent = '';
+    Object.keys(obj).sort(function (a, b) { return obj[b] - obj[a]; }).forEach(function (k) {
+      var tr = document.createElement('tr'), a = document.createElement('td'), b = document.createElement('td');
+      a.textContent = k; b.textContent = obj[k]; tr.appendChild(a); tr.appendChild(b); el.appendChild(tr);
+    });
+    if (!el.children.length) { el.innerHTML = '<tr><td class="dim">sem dados</td><td></td></tr>'; }
+  }
+  function show(d) {
+    $('login').hidden = true; $('data').hidden = false;
+    $('total').textContent = d.total;
+    var days = [], n = new Date();
+    for (var i = 29; i >= 0; i--) { var x = new Date(n.getTime() - i * 86400000); days.push(x.toISOString().slice(0, 10)); }
+    var max = Math.max(1, Math.max.apply(null, days.map(function (k) { return d.by_day[k] || 0; })));
+    $('bars').textContent = '';
+    days.forEach(function (k) {
+      var v = d.by_day[k] || 0, b = document.createElement('i');
+      b.style.height = Math.max(2, v / max * 100) + '%'; b.title = k + ': ' + v; $('bars').appendChild(b);
+    });
+    var week = days.slice(-7).reduce(function (s, k) { return s + (d.by_day[k] || 0); }, 0);
+    var month = days.reduce(function (s, k) { return s + (d.by_day[k] || 0); }, 0);
+    $('range').textContent = 'Novas: ' + (d.by_day[days[29]] || 0) + ' hoje · ' + week + ' em 7 dias · ' + month + ' em 30 dias';
+    rows($('ver'), d.by_version); rows($('os'), d.by_os);
+  }
+  async function load(pw) {
+    var r = await fetch('/api/stats', { headers: { Authorization: 'Bearer ' + pw }, cache: 'no-store' });
+    if (r.status === 401) throw new Error('Senha incorreta.');
+    if (!r.ok) throw new Error('Erro ' + r.status + '. Confira o banco e a ADMIN_TOKEN na Vercel.');
+    show(await r.json());
+  }
+  $('f').addEventListener('submit', function (e) {
+    e.preventDefault(); $('err').textContent = '';
+    var pw = $('pw').value;
+    load(pw).then(function () { try { sessionStorage.setItem('mutinho-pw', pw); } catch (x) {} })
+      .catch(function (x) { $('err').textContent = x.message; });
+  });
+  $('out').addEventListener('click', function (e) {
+    e.preventDefault(); try { sessionStorage.removeItem('mutinho-pw'); } catch (x) {} location.reload();
+  });
+  try { var saved = sessionStorage.getItem('mutinho-pw'); if (saved) load(saved).catch(function () {}); } catch (x) {}
+</script>
+</body>
+</html>

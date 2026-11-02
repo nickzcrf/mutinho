@@ -27,10 +27,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 # Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
 # Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
 UPDATE_URL = "https://mutinho.vercel.app/version.json"
+# Contagem anônima de instalações: um aviso único na primeira abertura (código aleatório, versão e sistema).
+INSTALL_URL = "https://mutinho.vercel.app/api/install"
 SYSTEM = platform.system()  # "Windows", "Darwin" ou "Linux"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mutinho.json")
 
@@ -44,6 +46,9 @@ DEFAULTS = {
     "start_hidden": False,
     "mode": "toggle",          # "toggle" (alternar) ou "ptt" (apertar para falar)
     "ptt_hotkey": "<f9>",
+    "count_installs": True,   # avisa uma única vez, de forma anônima, que o app foi instalado
+    "install_id": "",
+    "counted": False,
     "talk_muted": True,  # no modo alternar, segurar a tecla/botão fala sem desmutar de vez
     "ns_enabled": False,
     "ns_intensity": 60,
@@ -1014,6 +1019,130 @@ class NoiseSuppressor:
 
 
 # --------------------------------------------------------------------------
+# Iniciar com o computador
+# --------------------------------------------------------------------------
+def _launch_args():
+    """Comando que reabre o Mutinho escondido na bandeja."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--hidden"]
+    exe = sys.executable
+    if SYSTEM == "Windows" and exe.lower().endswith("python.exe"):
+        exe = exe[:-10] + "pythonw.exe"  # sem janela de console
+    return [exe, os.path.abspath(sys.argv[0]), "--hidden"]
+
+
+def _startup_shortcut():
+    """Atalho criado pelo instalador na pasta Inicializar (Windows)."""
+    appdata = os.environ.get("APPDATA", "")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Mutinho.lnk")
+
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_MAC_PLIST = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", "com.mutinho.app.plist")
+_LINUX_DESKTOP = os.path.join(os.path.expanduser("~"), ".config", "autostart", "mutinho.desktop")
+
+
+def autostart_enabled():
+    try:
+        if SYSTEM == "Windows":
+            import winreg
+
+            if os.path.exists(_startup_shortcut()):
+                return True
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+                winreg.QueryValueEx(key, APP_NAME)
+            return True
+        if SYSTEM == "Darwin":
+            return os.path.exists(_MAC_PLIST)
+        return os.path.exists(_LINUX_DESKTOP)
+    except Exception:
+        return False
+
+
+def set_autostart(enabled):
+    """Liga ou desliga o início junto com o computador. Levanta exceção se não conseguir."""
+    args = _launch_args()
+    if SYSTEM == "Windows":
+        import winreg
+
+        if enabled:
+            if os.path.exists(_startup_shortcut()):
+                return  # o instalador já cuidou disso
+            cmd = subprocess.list2cmdline(args)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                    winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+            try:
+                os.remove(_startup_shortcut())
+            except FileNotFoundError:
+                pass
+    elif SYSTEM == "Darwin":
+        if enabled:
+            from xml.sax.saxutils import escape
+
+            items = "".join(f"<string>{escape(a)}</string>" for a in args)
+            os.makedirs(os.path.dirname(_MAC_PLIST), exist_ok=True)
+            with open(_MAC_PLIST, "w", encoding="utf-8") as f:
+                f.write('<?xml version="1.0" encoding="UTF-8"?>\n'
+                        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                        '<plist version="1.0"><dict>'
+                        '<key>Label</key><string>com.mutinho.app</string>'
+                        f'<key>ProgramArguments</key><array>{items}</array>'
+                        '<key>RunAtLoad</key><true/></dict></plist>\n')
+        else:
+            try:
+                os.remove(_MAC_PLIST)
+            except FileNotFoundError:
+                pass
+    else:
+        if enabled:
+            os.makedirs(os.path.dirname(_LINUX_DESKTOP), exist_ok=True)
+            with open(_LINUX_DESKTOP, "w", encoding="utf-8") as f:
+                f.write("[Desktop Entry]\nType=Application\nName=Mutinho\n"
+                        f"Exec={subprocess.list2cmdline(args)}\nTerminal=false\n"
+                        "X-GNOME-Autostart-enabled=true\n")
+        else:
+            try:
+                os.remove(_LINUX_DESKTOP)
+            except FileNotFoundError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# Contagem anônima de instalações
+# --------------------------------------------------------------------------
+def report_install(cfg, url=None):
+    """Avisa uma única vez o servidor de que o app foi aberto. Devolve True se enviou agora.
+    Manda só: código aleatório, versão e sistema. Se falhar (sem internet), tenta na próxima abertura."""
+    url = url or INSTALL_URL
+    if not cfg.get("count_installs", True) or cfg.get("counted") or not url:
+        return False
+    p = urlparse(url)
+    if not (p.scheme == "https" or (p.scheme == "http" and p.hostname in ("localhost", "127.0.0.1"))):
+        return False
+    if not cfg.get("install_id"):
+        cfg["install_id"] = secrets.token_urlsafe(18)
+    body = json.dumps({"id": cfg["install_id"], "version": APP_VERSION, "os": SYSTEM}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            ok = 200 <= resp.status < 300
+    except Exception:
+        return False
+    if ok:
+        cfg["counted"] = True
+    return ok
+
+
+# --------------------------------------------------------------------------
 # Atualização automática
 # --------------------------------------------------------------------------
 _UA = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
@@ -1359,23 +1488,6 @@ class GUI:
         # ===== painel B: opções e celular =====
         B = self.panelB
         card = self._card(B)
-        self.var_sound = tk.BooleanVar(value=bool(self.cfg["sound"]))
-        self.var_top = tk.BooleanVar(value=bool(self.cfg["on_top"]))
-        self.var_ind = tk.BooleanVar(value=bool(self.cfg["indicator"]))
-        self.var_hidden = tk.BooleanVar(value=bool(self.cfg["start_hidden"]))
-        self.var_talkm = tk.BooleanVar(value=bool(self.cfg.get("talk_muted", True)))
-        for text, var, cmd in (
-            ("Segurar para falar estando mutado", self.var_talkm, self._opt_talk_muted),
-            ("Som ao mutar/desmutar", self.var_sound, self._opt_sound),
-            ("Manter janela sempre no topo", self.var_top, self._opt_top),
-            ("Indicador flutuante na tela", self.var_ind, self._opt_indicator),
-            ("Iniciar escondido na bandeja", self.var_hidden, self._opt_hidden),
-        ):
-            tk.Checkbutton(card, text=text, variable=var, command=cmd, bg=self.CARD, fg=self.FG,
-                           selectcolor=self.BG, activebackground=self.CARD, activeforeground=self.FG,
-                           highlightthickness=0, bd=0, anchor="w").pack(fill="x")
-
-        card = self._card(B)
         tk.Label(card, text="Controle pelo celular", bg=self.CARD, fg=self.DIM,
                  font=self.fonts["h9"]).pack(anchor="w")
         self.qr_canvas = tk.Canvas(card, bg="white", highlightthickness=0)
@@ -1393,8 +1505,32 @@ class GUI:
 
         # ===== painel C: redução de ruído =====
         self._build_noise(self.panelC)
+        self._build_options(self.panelC)
 
         self._layout(False)
+
+    def _build_options(self, parent):
+        tk = self.tk
+        card = self._card(parent)
+        self.var_sound = tk.BooleanVar(value=bool(self.cfg["sound"]))
+        self.var_top = tk.BooleanVar(value=bool(self.cfg["on_top"]))
+        self.var_ind = tk.BooleanVar(value=bool(self.cfg["indicator"]))
+        self.var_hidden = tk.BooleanVar(value=bool(self.cfg["start_hidden"]))
+        self.var_auto = tk.BooleanVar(value=autostart_enabled())
+        self.var_count = tk.BooleanVar(value=bool(self.cfg.get("count_installs", True)))
+        self.var_talkm = tk.BooleanVar(value=bool(self.cfg.get("talk_muted", True)))
+        for text, var, cmd in (
+            ("Segurar para falar estando mutado", self.var_talkm, self._opt_talk_muted),
+            ("Som ao mutar/desmutar", self.var_sound, self._opt_sound),
+            ("Manter janela sempre no topo", self.var_top, self._opt_top),
+            ("Indicador flutuante na tela", self.var_ind, self._opt_indicator),
+            ("Iniciar escondido na bandeja", self.var_hidden, self._opt_hidden),
+            ("Iniciar junto com o computador", self.var_auto, self._opt_autostart),
+            ("Contar esta instalação (anônimo, uma vez)", self.var_count, self._opt_count),
+        ):
+            tk.Checkbutton(card, text=text, variable=var, command=cmd, bg=self.CARD, fg=self.FG,
+                           selectcolor=self.BG, activebackground=self.CARD, activeforeground=self.FG,
+                           highlightthickness=0, bd=0, anchor="w").pack(fill="x")
 
     # ---- QR ---------------------------------------------------------------
     def _draw_qr(self):
@@ -1805,6 +1941,17 @@ class GUI:
         self.cfg["on_top"] = bool(self.var_top.get())
         self.root.attributes("-topmost", bool(self.var_top.get()))
 
+    def _opt_autostart(self):
+        want = bool(self.var_auto.get())
+        try:
+            set_autostart(want)
+        except Exception as exc:
+            self._say(f"Não foi possível alterar o início com o computador: {exc}")
+        self.var_auto.set(autostart_enabled())
+
+    def _opt_count(self):
+        self.cfg["count_installs"] = bool(self.var_count.get())
+
     def _opt_hidden(self):
         self.cfg["start_hidden"] = bool(self.var_hidden.get())
 
@@ -1834,6 +1981,7 @@ class GUI:
     # ---- ciclo de vida ----------------------------------------------------
     # ---- atualização automática -------------------------------------------
     def _start_update_check(self):
+        threading.Thread(target=report_install, args=(self.cfg,), daemon=True).start()
         if not update_enabled():
             return
 
