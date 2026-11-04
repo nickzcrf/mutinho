@@ -1,6 +1,6 @@
 {
-  "version": "1.5.0",
+  "version": "1.6.0",
   "url": "dist/Mutinho.exe",
-  "sha256": "d6b6a84a94eebee063dadb28ee5446332c933fb1d947a98d2903c7aefd9322a7",
-  "notes": "Iniciar com o computador e contagem anônima de instalações"
+  "sha256": "25364bc2560cd676a114f6a35e65cb76155596f5f4e4e023553b824c43080e9a",
+  "notes": "Ouvir a própria voz e redução de ruído por IA (RNNoise)"
 }

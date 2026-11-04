@@ -3,6 +3,8 @@ qrcode>=7.4
 pystray>=0.19.5
 pillow>=10.0
 numpy>=1.26
+# Opcional, para a redução de ruído por IA (só a biblioteca nativa; sem dependências pesadas):
+#   python -m pip install --no-deps pyrnnoise
 sounddevice>=0.4.6
 pycaw; sys_platform == "win32"
 comtypes; sys_platform == "win32"

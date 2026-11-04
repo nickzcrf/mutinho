@@ -1,9 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
 hiddenimports = ['pystray._win32']
+binaries += collect_dynamic_libs('pyrnnoise')
 tmp_ret = collect_all('_sounddevice_data')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

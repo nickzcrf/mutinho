@@ -10,7 +10,8 @@ Muta o microfone com um atalho global e desmuta pelo celular com um QR code. Gr�
 - **Controle pelo celular**: escaneie o QR da janela e use um botão grande no navegador do celular (mesmo Wi-Fi, link com código secreto que pode ser trocado).
 - **Falar mesmo mutado**: estando mutado, segure uma tecla (padrão `F9`), o círculo da janela ou o botão no celular. O microfone abre enquanto você segura e volta a mutar ao soltar. Um toque rápido no círculo desmuta de vez.
 - **Modo "Apertar para falar"**: o microfone fica sempre fechado e abre só enquanto você segura.
-- **Redução de ruído** com intensidade de 0 a 100% (ventilador, ar-condicionado, chiado). Usa um microfone virtual (VB-CABLE, incluído no instalador do Windows).
+- **Redução de ruído** com dois modos: **IA (RNNoise)**, uma rede neural feita para voz, e **Clássico** (filtro espectral). Intensidade de 0 a 100% (ventilador, ar-condicionado, chiado, barulho de fundo). Usa um microfone virtual (VB-CABLE, incluído no instalador do Windows).
+- **Ouvir a própria voz** nos fones (já limpa pela redução de ruído), para você checar como está soando. Fica no quadro da redução de ruído; use fones para não dar eco.
 - **Tela cheia** (`F11`) e janela **maximizável**: a interface se adapta ao tamanho.
 - **Bandeja do sistema**, indicador flutuante, som ao mutar e início escondido.
 - **Iniciar com o computador**, escondido na bandeja (opção na janela ou no instalador).
@@ -86,7 +87,8 @@ python mutinho.py --fake     # microfone simulado, para testes
 ## Gerar os executáveis (Windows)
 
 ```powershell
-python -m PyInstaller --onefile --windowed --name Mutinho --hidden-import pystray._win32 --collect-all _sounddevice_data --distpath siteMutinho\dist mutinho.py
+python -m pip install --no-deps pyrnnoise
+python -m PyInstaller --onefile --windowed --name Mutinho --hidden-import pystray._win32 --collect-all _sounddevice_data --collect-binaries pyrnnoise --distpath siteMutinho\dist mutinho.py
 python release.py "o que mudou"   # grava siteMutinho/version.json (versão + SHA-256)
 python make_installer.py          # gera siteMutinho/dist/MutinhoSetup.exe (Inno Setup 6+)
 ```
@@ -110,4 +112,5 @@ O site tem duas funções na Vercel (`siteMutinho/api`) e um painel em `/admin`,
 ## Créditos e licenças
 
 - O instalador do Windows inclui o **VB-CABLE**, microfone virtual da [VB-Audio Software](https://vb-cable.com) (donationware; contribuições são bem-vindas).
+- A redução de ruído por IA usa o [RNNoise](https://gitlab.xiph.org/xiph/rnnoise) (Xiph.Org, licença BSD-3-Clause), carregado pela biblioteca nativa distribuída no pacote [pyrnnoise](https://pypi.org/project/pyrnnoise/) (Apache-2.0).
 - Feito com Python, tkinter, pynput, pycaw, sounddevice, numpy, qrcode e pystray.

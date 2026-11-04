@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 # Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
 # Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
 UPDATE_URL = "https://mutinho.vercel.app/version.json"
@@ -52,8 +52,11 @@ DEFAULTS = {
     "talk_muted": True,  # no modo alternar, segurar a tecla/botão fala sem desmutar de vez
     "ns_enabled": False,
     "ns_intensity": 60,
+    "ns_mode": "ai",        # "ai" = RNNoise (rede neural); "classic" = subtração espectral
     "ns_in": "",
     "ns_out": "",
+    "monitor": False,       # ouvir a própria voz (áudio já limpo) nos fones
+    "monitor_out": "",
     "mac_prev_volume": 70,
 }
 
@@ -887,18 +890,133 @@ class NoiseReducer:
         return out
 
 
+_RNN = {"lib": None, "err": None, "tried": False}
+
+
+def _rnnoise_candidates():
+    """Lugares onde a biblioteca nativa do RNNoise (rnnoise.dll / librnnoise.*) pode estar."""
+    names = {"Windows": ["rnnoise.dll"], "Darwin": ["librnnoise.dylib"]}.get(SYSTEM, ["librnnoise.so"])
+    dirs = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        dirs += [os.path.join(base, "pyrnnoise"), base]
+    dirs.append(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)))
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("pyrnnoise")  # só localiza a pasta, não importa (evita dependências pesadas)
+        if spec and spec.submodule_search_locations:
+            dirs += list(spec.submodule_search_locations)
+    except Exception:
+        pass
+    for d in dirs:
+        for n in names:
+            yield os.path.join(d, n)
+    if base:  # último recurso: procura em qualquer subpasta do pacote
+        for root, _dirs, files in os.walk(base):
+            for n in names:
+                if n in files:
+                    yield os.path.join(root, n)
+
+
+def _load_rnnoise():
+    """Carrega o RNNoise uma vez. Devolve (lib, erro)."""
+    if _RNN["tried"]:
+        return _RNN["lib"], _RNN["err"]
+    _RNN["tried"] = True
+    import ctypes
+
+    last = "biblioteca do RNNoise não encontrada (instale: python -m pip install --no-deps pyrnnoise)"
+    for path in _rnnoise_candidates():
+        if not os.path.exists(path):
+            continue
+        try:
+            lib = ctypes.CDLL(path)
+            lib.rnnoise_create.argtypes = [ctypes.c_void_p]
+            lib.rnnoise_create.restype = ctypes.c_void_p
+            lib.rnnoise_destroy.argtypes = [ctypes.c_void_p]
+            lib.rnnoise_process_frame.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+                                                  ctypes.POINTER(ctypes.c_float)]
+            lib.rnnoise_process_frame.restype = ctypes.c_float
+            lib.rnnoise_get_frame_size.restype = ctypes.c_int
+            if int(lib.rnnoise_get_frame_size()) != NoiseReducer.HOP:
+                last = "o RNNoise usa blocos de tamanho diferente do esperado"
+                continue
+            _RNN["lib"] = lib
+            _RNN["err"] = None
+            return lib, None
+        except Exception as exc:
+            last = f"não consegui carregar o RNNoise: {exc}"
+    _RNN["err"] = last
+    return None, last
+
+
+class RnnoiseReducer:
+    """Redução de ruído por rede neural (RNNoise, Xiph.Org, licença BSD).
+    Mesma interface do NoiseReducer. `intensity` 0..100 mistura o áudio limpo com o original."""
+
+    def __init__(self):
+        import numpy as np
+
+        self.np = np
+        lib, err = _load_rnnoise()
+        if lib is None:
+            raise RuntimeError(err)
+        self.lib = lib
+        self.state = None
+        self.intensity = 60
+        self.reset()
+
+    @staticmethod
+    def available():
+        lib, err = _load_rnnoise()
+        return lib is not None, err or ""
+
+    def reset(self):
+        if self.state is not None:
+            self.lib.rnnoise_destroy(self.state)
+        self.state = self.lib.rnnoise_create(None)
+        self.buf = self.np.zeros(NoiseReducer.HOP, dtype=self.np.float32)
+
+    def __del__(self):
+        try:
+            if self.state is not None:
+                self.lib.rnnoise_destroy(self.state)
+        except Exception:
+            pass
+
+    def process(self, x):
+        import ctypes
+
+        np = self.np
+        t = max(0.0, min(1.0, self.intensity / 100.0))
+        if t <= 0.0:
+            return np.asarray(x, dtype=float)
+        frame = np.ascontiguousarray(np.asarray(x, dtype=np.float32) * 32768.0)
+        out = np.empty_like(frame)
+        self.lib.rnnoise_process_frame(self.state, out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                       frame.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        clean = out.astype(float) / 32768.0
+        return (1.0 - t) * np.asarray(x, dtype=float) + t * clean
+
+
 class NoiseSuppressor:
     """Captura o microfone, limpa o áudio e envia para uma saída (microfone virtual)."""
 
     def __init__(self, ctrl):
         self.ctrl = ctrl
         self.reducer = None
+        self.mode = "ai"
+        self.active_mode = "classic"
         self.stream = None
         self.running = False
         self.in_level = 0.0
         self.out_level = 0.0
         self._inbuf = None
         self._outbuf = None
+        self.mon_stream = None
+        self._mon_buf = None
+        self._mon_lock = threading.Lock()
 
     @staticmethod
     def available():
@@ -939,9 +1057,29 @@ class NoiseSuppressor:
                 return name
         return None
 
+    def _make_reducer(self):
+        """Cria o redutor do modo escolhido; se a IA não estiver disponível, usa o clássico."""
+        self.active_mode = "classic"
+        if self.mode == "ai":
+            try:
+                reducer = RnnoiseReducer()
+                self.active_mode = "ai"
+                return reducer
+            except Exception:
+                pass
+        return NoiseReducer()
+
+    def set_mode(self, mode):
+        """Troca o tipo de redução. Se estiver rodando, o chamador deve reiniciar (start)."""
+        self.mode = "classic" if mode == "classic" else "ai"
+        keep = self.reducer.intensity if self.reducer is not None else None
+        self.reducer = self._make_reducer()
+        if keep is not None:
+            self.reducer.intensity = keep
+
     def set_intensity(self, value):
         if self.reducer is None:
-            self.reducer = NoiseReducer()
+            self.reducer = self._make_reducer()
         self.reducer.intensity = int(value)
 
     def start(self, in_name, out_name):
@@ -964,7 +1102,7 @@ class NoiseSuppressor:
             return "Escolha a saída (o microfone virtual, ex.: CABLE Input)."
 
         if self.reducer is None:
-            self.reducer = NoiseReducer()
+            self.reducer = self._make_reducer()
         self.reducer.reset()
         np = self.reducer.np
         self._inbuf = np.zeros(0)
@@ -1000,12 +1138,69 @@ class NoiseSuppressor:
             if self.ctrl.last_muted:
                 y[:] = 0.0
             y = np.clip(y, -1.0, 1.0)
+            if self.mon_stream is not None:
+                with self._mon_lock:
+                    buf = np.concatenate((self._mon_buf, y))
+                    limit = NoiseReducer.RATE // 5  # no máximo 200 ms guardados: descarta o mais antigo
+                    self._mon_buf = buf[-limit:] if len(buf) > limit else buf
             self.out_level = 0.7 * self.out_level + 0.3 * float(np.sqrt(np.mean(y * y)))
             outdata[:] = y.astype("float32")[:, None]
         except Exception:
             outdata[:] = 0
 
+    # ---- ouvir a própria voz (nos fones) ----
+    def set_monitor(self, out_name):
+        """Liga (nome do dispositivo) ou desliga (None) o retorno da voz. Devolve None ou um erro."""
+        self._close_monitor()
+        if not out_name:
+            return None
+        if not self.running:
+            return "Ligue a redução de ruído para ouvir a sua voz."
+        import sounddevice as sd
+
+        try:
+            _ins, outs = self.devices()
+        except Exception as exc:
+            return f"Não consegui listar os dispositivos de áudio: {exc}"
+        idx = next((i for i, n in outs if n == out_name), None)
+        if idx is None:
+            return "Escolha os fones (ou alto-falantes) para ouvir a sua voz."
+        np = self.reducer.np
+        ch = max(1, min(2, int(sd.query_devices(idx)["max_output_channels"])))
+        self._mon_buf = np.zeros(NoiseReducer.HOP)
+
+        def callback(outdata, frames, time_info, status):
+            try:
+                with self._mon_lock:
+                    n = min(frames, len(self._mon_buf))
+                    block = np.zeros(frames)
+                    block[:n] = self._mon_buf[:n]
+                    self._mon_buf = self._mon_buf[n:]
+                outdata[:] = block.astype("float32")[:, None]
+            except Exception:
+                outdata[:] = 0
+
+        try:
+            stream = sd.OutputStream(samplerate=NoiseReducer.RATE, blocksize=NoiseReducer.HOP,
+                                     device=idx, channels=ch, dtype="float32", latency="low",
+                                     callback=callback)
+            stream.start()
+        except Exception as exc:
+            return f"Não consegui abrir os fones: {exc}"
+        self.mon_stream = stream
+        return None
+
+    def _close_monitor(self):
+        stream, self.mon_stream = self.mon_stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
     def stop(self):
+        self._close_monitor()
         self.running = False
         if self.stream is not None:
             try:
@@ -2027,6 +2222,7 @@ class GUI:
     def _build_noise(self, parent):
         tk = self.tk
         self.ns = NoiseSuppressor(self.ctrl)
+        self.ns.set_mode(self.cfg.get("ns_mode", "ai"))
         card = self._card(parent)
         tk.Label(card, text="Redução de ruído", bg=self.CARD, fg=self.DIM,
                  font=self.fonts["h9"]).pack(anchor="w")
@@ -2045,6 +2241,16 @@ class GUI:
                        command=self._ns_toggle, bg=self.CARD, fg=self.FG, selectcolor=self.BG,
                        activebackground=self.CARD, activeforeground=self.FG,
                        highlightthickness=0, bd=0, anchor="w").pack(fill="x", pady=(6, 0))
+
+        seg = tk.Frame(card, bg=self.BG, padx=2, pady=2)
+        seg.pack(anchor="w", pady=(8, 0))
+        self.ns_mode_btns = {}
+        for key, text in (("ai", "IA (RNNoise)"), ("classic", "Clássico")):
+            lbl = tk.Label(seg, text=text, padx=12, pady=4, font=self.fonts["h9b"], cursor="hand2")
+            lbl.bind("<Button-1>", lambda e, k=key: self._ns_set_mode(k))
+            lbl.pack(side="left")
+            self.ns_mode_btns[key] = lbl
+        self._style_ns_mode()
 
         self.ns_label = tk.Label(card, text="", bg=self.CARD, fg=self.FG,
                                  font=self.fonts["h10b"])
@@ -2075,6 +2281,16 @@ class GUI:
         self._style_menu(self.ns_out_menu)
         self.ns_out_menu.pack(fill="x")
 
+        self.var_mon = tk.BooleanVar(value=False)
+        tk.Checkbutton(card, text="Ouvir minha própria voz (use fones)", variable=self.var_mon,
+                       command=self._mon_toggle, bg=self.CARD, fg=self.FG, selectcolor=self.BG,
+                       activebackground=self.CARD, activeforeground=self.FG,
+                       highlightthickness=0, bd=0, anchor="w").pack(fill="x", pady=(12, 0))
+        self.mon_out = tk.StringVar()
+        self.mon_out_menu = tk.OptionMenu(card, self.mon_out, "")
+        self._style_menu(self.mon_out_menu)
+        self.mon_out_menu.pack(fill="x", pady=(4, 0))
+
         self.ns_meter = tk.Canvas(card, width=290, height=36, bg=self.CARD, highlightthickness=0)
         self.ns_meter.pack(pady=(12, 0))
 
@@ -2091,13 +2307,17 @@ class GUI:
         if self.cfg["ns_enabled"]:
             self.var_ns.set(True)
             self._ns_toggle()
+            if self.cfg.get("monitor") and self.ns.running:
+                self.var_mon.set(True)
+                self._mon_toggle()
         self.root.after(200, self._ns_meter)
 
-    def _fill_menu(self, menu_button, var, names, preferred, fallback_first):
+    def _fill_menu(self, menu_button, var, names, preferred, fallback_first, pick=None):
         menu = menu_button["menu"]
         menu.delete(0, "end")
+        pick = pick or self._ns_pick
         for name in names:
-            menu.add_command(label=name, command=lambda v=name, s=var: self._ns_pick(s, v))
+            menu.add_command(label=name, command=lambda v=name, s=var: pick(s, v))
         if preferred in names:
             var.set(preferred)
         elif fallback_first and names:
@@ -2119,6 +2339,9 @@ class GUI:
                         self.cfg["ns_in"] or default_in, True)
         self._fill_menu(self.ns_out_menu, self.ns_out, out_names,
                         self.cfg["ns_out"] or virtual, False)
+        mon_names = [n for n in out_names if n != virtual]
+        self._fill_menu(self.mon_out_menu, self.mon_out, mon_names,
+                        self.cfg.get("monitor_out") or "", False, pick=self._mon_pick)
         if virtual:
             self.ns_help.configure(
                 text="Microfone virtual encontrado. Nos aplicativos (Meet, Discord, Zoom), "
@@ -2136,6 +2359,52 @@ class GUI:
         if self.var_ns.get():
             self._ns_toggle()  # reinicia com os dispositivos novos
 
+    def _style_ns_mode(self):
+        current = self.cfg.get("ns_mode", "ai")
+        for key, lbl in self.ns_mode_btns.items():
+            on = key == current
+            lbl.configure(bg=self.ACCENT if on else self.CARD, fg="white" if on else self.DIM)
+
+    def _ns_set_mode(self, mode):
+        if mode == self.cfg.get("ns_mode", "ai"):
+            return
+        self.cfg["ns_mode"] = mode
+        self.ns.set_mode(mode)
+        self.ns.reducer.intensity = int(self.ns_scale.get())
+        self._style_ns_mode()
+        if mode == "ai" and self.ns.active_mode != "ai":
+            ok, err = RnnoiseReducer.available()
+            self.ns_status.configure(
+                text=f"IA indisponível, usando o modo clássico: {err}", fg=self.MUTE)
+        elif self.var_ns.get():
+            self._ns_toggle()  # reinicia com o novo tipo
+        else:
+            self.ns_status.configure(text="", fg=self.DIM)
+
+    def _mon_pick(self, var, value):
+        var.set(value)
+        self.cfg["monitor_out"] = value
+        if self.var_mon.get():
+            self._mon_toggle()
+
+    def _mon_toggle(self):
+        if self.var_mon.get():
+            err = self.ns.set_monitor(self.mon_out.get())
+            if err:
+                self.var_mon.set(False)
+                self.cfg["monitor"] = False
+                self.ns_status.configure(text=err, fg=self.MUTE)
+                return
+            self.cfg["monitor"] = True
+            self.ns_status.configure(text="Você está ouvindo a sua voz já limpa. Use fones para não dar eco.",
+                                     fg=self.LIVE)
+        else:
+            self.ns.set_monitor(None)
+            self.cfg["monitor"] = False
+            if self.ns.running:
+                self.ns_status.configure(text="Ativo: seu áudio está sendo limpo"
+                                              + (" pela IA." if self.ns.active_mode == "ai" else "."), fg=self.LIVE)
+
     def _ns_toggle(self):
         if self.var_ns.get():
             err = self.ns.start(self.ns_in.get(), self.ns_out.get())
@@ -2144,9 +2413,18 @@ class GUI:
                 self.ns_status.configure(text=err, fg=self.MUTE)
                 return
             self.cfg["ns_enabled"] = True
-            self.ns_status.configure(text="Ativo: seu áudio está sendo limpo.", fg=self.LIVE)
+            if self.cfg.get("ns_mode", "ai") == "ai" and self.ns.active_mode != "ai":
+                self.ns_status.configure(text="Ativo (modo clássico: a IA não está disponível nesta instalação).",
+                                         fg=self.LIVE)
+            else:
+                self.ns_status.configure(text="Ativo: seu áudio está sendo limpo"
+                                              + (" pela IA." if self.ns.active_mode == "ai" else "."), fg=self.LIVE)
+            if self.var_mon.get():
+                self._mon_toggle()  # reabre o retorno junto com o novo fluxo
         else:
             self.ns.stop()
+            self.var_mon.set(False)
+            self.cfg["monitor"] = False
             self.cfg["ns_enabled"] = False
             self.ns_status.configure(text="", fg=self.DIM)
 
