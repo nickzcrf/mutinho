@@ -1759,14 +1759,16 @@ class GUI:
 
     def _style_titlebar(self):
         """Barra de título escura (minimizar, maximizar, fechar) no Windows 10/11."""
-        if SYSTEM != "Windows":
+        if SYSTEM != "Windows" or os.environ.get("MUTINHO_NO_TITLEBAR"):
             return
         try:
             import ctypes
             from ctypes import wintypes
 
             self.root.update_idletasks()
-            user32, dwm = ctypes.windll.user32, ctypes.windll.dwmapi
+            # cópias próprias das DLLs: não mexem nas definições usadas por pystray/pynput
+            user32 = ctypes.WinDLL("user32")
+            dwm = ctypes.WinDLL("dwmapi")
             user32.GetParent.argtypes = [wintypes.HWND]
             user32.GetParent.restype = wintypes.HWND
             hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
@@ -2955,6 +2957,14 @@ class GUI:
 # Entrada
 # --------------------------------------------------------------------------
 def main():
+    try:  # falhas nativas (fecha sem erro do Python) também ficam registradas
+        import faulthandler
+
+        global _FAULT_LOG
+        _FAULT_LOG = open(os.path.join(os.path.expanduser("~"), "mutinho-erro.log"), "w")
+        faulthandler.enable(file=_FAULT_LOG)
+    except Exception:
+        pass
     args = sys.argv[1:]
     cfg = Config()
     backend = make_backend(cfg, fake="--fake" in args)
@@ -2999,5 +3009,35 @@ def main():
     gui.run()
 
 
+def _report_crash():
+    """Sem console (.exe), um erro fecha o app sem avisar. Grava o erro num arquivo e mostra na tela."""
+    import traceback
+
+    text = traceback.format_exc()
+    path = os.path.join(os.path.expanduser("~"), "mutinho-erro.log")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{APP_NAME} {APP_VERSION}\n{platform.platform()}\nPython {sys.version}\n\n{text}")
+    except Exception:
+        pass
+    if SYSTEM == "Windows":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                0, f"O Mutinho fechou por um erro.\nDetalhes salvos em:\n{path}\n\n{text[-700:]}",
+                "Mutinho", 0x10)
+        except Exception:
+            pass
+    else:
+        sys.stderr.write(text)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        _report_crash()
+        sys.exit(1)
