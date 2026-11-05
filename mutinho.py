@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 # Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
 # Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
 UPDATE_URL = "https://mutinho.vercel.app/version.json"

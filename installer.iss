@@ -4,7 +4,7 @@
 ;   vbcable\                          (conteúdo extraído do pacote do VB-CABLE, de vb-audio.com/Cable)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.6.0"
+  #define MyAppVersion "1.6.1"
 #endif
 #define MyAppName "Mutinho"
 #define MyAppExe "Mutinho.exe"
@@ -39,8 +39,8 @@ Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortugue
 
 [Tasks]
 Name: "vbcable"; Description: "Instalar o microfone virtual (VB-CABLE), necessário para a redução de ruído funcionar no Meet, Discord e Zoom"; GroupDescription: "Redução de ruído:"
-Name: "autostart"; Description: "Iniciar o Mutinho junto com o Windows (escondido na bandeja)"; GroupDescription: "Opções:"; Flags: unchecked
-Name: "desktopicon"; Description: "Criar atalho na área de trabalho"; GroupDescription: "Opções:"; Flags: unchecked
+Name: "autostart"; Description: "Iniciar o Mutinho junto com o Windows (escondido na bandeja)"; GroupDescription: "Opções:"
+Name: "desktopicon"; Description: "Criar atalho na área de trabalho"; GroupDescription: "Opções:"
 
 [Files]
 Source: "siteMutinho\dist\Mutinho.exe"; DestDir: "{app}"; Flags: ignoreversion
