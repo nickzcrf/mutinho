@@ -1,6 +1,6 @@
 {
   "version": "1.6.1",
   "url": "dist/Mutinho.exe",
-  "sha256": "24629b789cbe4edb8b1ede1ee4e0d14d28640f51fda1929841d39967129fe0b8",
-  "notes": "Interface nova, barra de título escura, ouvir minha voz com volume"
+  "sha256": "d2d62c3998044e34873fdf2a5e90388b63743c1a07035a980e4cabe3055976c2",
+  "notes": "Interface nova e volume da voz"
 }
