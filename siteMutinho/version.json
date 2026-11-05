@@ -1,6 +1,6 @@
 {
   "version": "1.6.0",
   "url": "dist/Mutinho.exe",
-  "sha256": "25364bc2560cd676a114f6a35e65cb76155596f5f4e4e023553b824c43080e9a",
-  "notes": "Ouvir a própria voz e redução de ruído por IA (RNNoise)"
+  "sha256": "22e5a815e526ca276814406127250a85c65b16bb1c6328a90d09354466315c2a",
+  "notes": "Interface nova, barra de título escura, ouvir minha voz com volume"
 }

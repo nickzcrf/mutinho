@@ -11,7 +11,7 @@ Muta o microfone com um atalho global e desmuta pelo celular com um QR code. Gr�
 - **Falar mesmo mutado**: estando mutado, segure uma tecla (padrão `F9`), o círculo da janela ou o botão no celular. O microfone abre enquanto você segura e volta a mutar ao soltar. Um toque rápido no círculo desmuta de vez.
 - **Modo "Apertar para falar"**: o microfone fica sempre fechado e abre só enquanto você segura.
 - **Redução de ruído** com dois modos: **IA (RNNoise)**, uma rede neural feita para voz, e **Clássico** (filtro espectral). Intensidade de 0 a 100% (ventilador, ar-condicionado, chiado, barulho de fundo). Usa um microfone virtual (VB-CABLE, incluído no instalador do Windows).
-- **Ouvir a própria voz** nos fones (já limpa pela redução de ruído), para você checar como está soando. Fica no quadro da redução de ruído; use fones para não dar eco.
+- **Ouvir a própria voz** nos fones, com controle de volume. Funciona com ou sem a redução de ruído (com ela ligada, você ouve o áudio já limpo). Use fones para não dar eco.
 - **Tela cheia** (`F11`) e janela **maximizável**: a interface se adapta ao tamanho.
 - **Bandeja do sistema**, indicador flutuante, som ao mutar e início escondido.
 - **Iniciar com o computador**, escondido na bandeja (opção na janela ou no instalador).

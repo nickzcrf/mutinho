@@ -57,6 +57,7 @@ DEFAULTS = {
     "ns_out": "",
     "monitor": False,       # ouvir a própria voz (áudio já limpo) nos fones
     "monitor_out": "",
+    "monitor_vol": 60,      # volume do retorno da própria voz (0..100)
     "mac_prev_volume": 70,
 }
 
@@ -1015,6 +1016,8 @@ class NoiseSuppressor:
         self._inbuf = None
         self._outbuf = None
         self.mon_stream = None
+        self.mon_in = None
+        self.mon_gain = self.volume_to_gain(60)
         self._mon_buf = None
         self._mon_lock = threading.Lock()
 
@@ -1149,23 +1152,35 @@ class NoiseSuppressor:
             outdata[:] = 0
 
     # ---- ouvir a própria voz (nos fones) ----
-    def set_monitor(self, out_name):
-        """Liga (nome do dispositivo) ou desliga (None) o retorno da voz. Devolve None ou um erro."""
+    @staticmethod
+    def volume_to_gain(vol):
+        """0..100 -> ganho 0x..6x (60% = 3,6x, cerca de +11 dB: o microfone costuma sair baixo nos fones)."""
+        return max(0.0, min(100.0, float(vol))) / 100.0 * 6.0
+
+    def set_monitor_volume(self, vol):
+        self.mon_gain = self.volume_to_gain(vol)
+
+    def set_monitor(self, out_name, in_name=None):
+        """Liga (nome dos fones) ou desliga (None) o retorno da própria voz. Devolve None ou um erro.
+        Com a redução de ruído ligada, você ouve o áudio limpo; sem ela, ouve o microfone direto."""
         self._close_monitor()
         if not out_name:
             return None
-        if not self.running:
-            return "Ligue a redução de ruído para ouvir a sua voz."
+        import numpy as np
         import sounddevice as sd
 
         try:
-            _ins, outs = self.devices()
+            ins, outs = self.devices()
         except Exception as exc:
             return f"Não consegui listar os dispositivos de áudio: {exc}"
         idx = next((i for i, n in outs if n == out_name), None)
         if idx is None:
             return "Escolha os fones (ou alto-falantes) para ouvir a sua voz."
-        np = self.reducer.np
+        in_idx = None
+        if not self.running:
+            in_idx = next((i for i, n in ins if n == in_name), None)
+            if in_idx is None:
+                return "Escolha o seu microfone."
         ch = max(1, min(2, int(sd.query_devices(idx)["max_output_channels"])))
         self._mon_buf = np.zeros(NoiseReducer.HOP)
 
@@ -1176,9 +1191,25 @@ class NoiseSuppressor:
                     block = np.zeros(frames)
                     block[:n] = self._mon_buf[:n]
                     self._mon_buf = self._mon_buf[n:]
+                # ganho + limitador suave (não estoura nem distorce de forma áspera)
+                block = np.tanh(block * self.mon_gain)
                 outdata[:] = block.astype("float32")[:, None]
             except Exception:
                 outdata[:] = 0
+
+        def feed(indata, frames, time_info, status):
+            # sem redução de ruído: o microfone vai direto para os fones (mudo = silêncio)
+            try:
+                x = np.asarray(indata[:, 0], dtype=float)
+                self.in_level = 0.7 * self.in_level + 0.3 * float(np.sqrt(np.mean(x * x)))
+                if self.ctrl.last_muted:
+                    x = np.zeros_like(x)
+                with self._mon_lock:
+                    buf = np.concatenate((self._mon_buf, x))
+                    limit = NoiseReducer.RATE // 5
+                    self._mon_buf = buf[-limit:] if len(buf) > limit else buf
+            except Exception:
+                pass
 
         try:
             stream = sd.OutputStream(samplerate=NoiseReducer.RATE, blocksize=NoiseReducer.HOP,
@@ -1188,16 +1219,27 @@ class NoiseSuppressor:
         except Exception as exc:
             return f"Não consegui abrir os fones: {exc}"
         self.mon_stream = stream
+        if in_idx is not None:
+            try:
+                self.mon_in = sd.InputStream(samplerate=NoiseReducer.RATE, blocksize=NoiseReducer.HOP,
+                                             device=in_idx, channels=1, dtype="float32", latency="low",
+                                             callback=feed)
+                self.mon_in.start()
+            except Exception as exc:
+                self._close_monitor()
+                return f"Não consegui abrir o microfone: {exc}"
         return None
 
     def _close_monitor(self):
-        stream, self.mon_stream = self.mon_stream, None
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
+        for attr in ("mon_stream", "mon_in"):
+            stream = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
 
     def stop(self):
         self._close_monitor()
@@ -1513,19 +1555,125 @@ class Tray:
 # --------------------------------------------------------------------------
 # Interface gráfica (tkinter)
 # --------------------------------------------------------------------------
-class GUI:
-    BG = "#14161a"
-    CARD = "#1d2026"
-    FG = "#e8eaed"
-    DIM = "#9aa0a6"
-    LIVE = "#22c55e"
-    MUTE = "#ef4444"
-    ACCENT = "#3b82f6"
+def _blend(c1, c2, t):
+    """Mistura duas cores #rrggbb: t=0 devolve c1, t=1 devolve c2."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
 
-    # nome: (tamanho em pontos, negrito). Todas escalam juntas na tela cheia.
+
+def _round_rect(canvas, x0, y0, x1, y1, r, **kw):
+    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+           x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+    return canvas.create_polygon(pts, smooth=True, **kw)
+
+
+def app_icon_image(size=64):
+    """Ícone do app (microfone sobre quadrado verde), usado na janela."""
+    from PIL import Image, ImageDraw
+
+    k = size / 64.0
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((2 * k, 2 * k, 62 * k, 62 * k), radius=16 * k, fill="#2fd27a")
+    dark = "#07140d"
+    d.rounded_rectangle((25 * k, 12 * k, 39 * k, 36 * k), radius=7 * k, fill=dark)
+    d.arc((19 * k, 22 * k, 45 * k, 46 * k), start=0, end=180, fill=dark, width=max(2, int(3 * k)))
+    d.line((32 * k, 46 * k, 32 * k, 53 * k), fill=dark, width=max(2, int(3 * k)))
+    d.line((24 * k, 53 * k, 40 * k, 53 * k), fill=dark, width=max(2, int(3 * k)))
+    return img
+
+
+class _Slider:
+    """Controle deslizante desenhado no Canvas (trilho fino e botão redondo)."""
+
+    def __init__(self, gui, parent, bg, lo, hi, value, command=None, on_release=None):
+        self.g = gui
+        self.lo, self.hi = lo, hi
+        self.value = max(lo, min(hi, value))
+        self.command, self.on_release = command, on_release
+        self.bg = bg
+        self.c = gui.tk.Canvas(parent, bg=bg, height=gui.S(26), highlightthickness=0, cursor="hand2")
+        self.c.bind("<Configure>", lambda e: self.redraw())
+        self.c.bind("<Button-1>", self._move)
+        self.c.bind("<B1-Motion>", self._move)
+        self.c.bind("<ButtonRelease-1>", self._release)
+        gui._sliders.append(self)
+
+    def pack(self, **kw):
+        self.c.pack(**kw)
+
+    def get(self):
+        return self.value
+
+    def set(self, v):
+        self.value = max(self.lo, min(self.hi, v))
+        self.redraw()
+
+    def resize(self):
+        self.c.configure(height=self.g.S(26))
+        self.redraw()
+
+    def _move(self, event):
+        pad = self.g.S(11)
+        width = max(1, self.c.winfo_width() - 2 * pad)
+        frac = min(1.0, max(0.0, (event.x - pad) / width))
+        v = int(round(self.lo + (self.hi - self.lo) * frac))
+        if v != self.value:
+            self.value = v
+            self.redraw()
+            if self.command:
+                self.command(v)
+
+    def _release(self, event):
+        if self.on_release:
+            self.on_release()
+
+    def redraw(self):
+        g, c = self.g, self.c
+        S = g.S
+        c.delete("all")
+        w = c.winfo_width()
+        if w <= 1:
+            w = S(300)
+        h = S(26)
+        pad, cy, th = S(11), h // 2, max(3, S(6))
+        frac = (self.value - self.lo) / float(self.hi - self.lo or 1)
+        x = pad + (w - 2 * pad) * frac
+        c.create_line(pad, cy, w - pad, cy, width=th, capstyle="round", fill="#262d3a")
+        if x > pad:
+            c.create_line(pad, cy, x, cy, width=th, capstyle="round", fill=g.ACCENT)
+        r = S(9)
+        c.create_oval(x - r, cy - r, x + r, cy + r, fill="white",
+                      outline=_blend(g.ACCENT, g.CARD, 0.35), width=max(2, S(3)))
+class GUI:
+    BG = "#0a0c0f"
+    CARD = "#11141a"
+    BORDER = "#232833"
+    RAISED = "#1b2029"
+    INPUT = "#0d1015"
+    FG = "#eef1f6"
+    DIM = "#8a93a3"
+    LIVE = "#2fd27a"
+    MUTE = "#f2555a"
+    ACCENT = "#3b82f6"
+    SEG_ON = "#1d3358"
+    SEG_ON_FG = "#9cc4ff"
+    ORB = 210   # tamanho base do círculo (com o brilho)
+    QR = 168    # tamanho base do QR code
+    CW = 400    # largura base de cada coluna
+
+    # nome: (tamanho em pontos, negrito, família). Todas escalam juntas na tela cheia.
     FONT_SPECS = {
-        "h8": (8, False), "h9": (9, False), "h9b": (9, True), "h10b": (10, True),
-        "h11b": (11, True), "h13b": (13, True), "h15b": (15, True), "h54": (54, False),
+        "h8": (8, False, "sans"), "h9": (9, False, "sans"), "h9b": (9, True, "sans"),
+        "h10": (10, False, "sans"), "h10b": (10, True, "sans"), "h11b": (11, True, "sans"),
+        "h13b": (13, True, "sans"), "h16b": (16, True, "sans"), "h19b": (19, True, "sans"),
+        "cap": (8, True, "sans"), "m8": (8, False, "mono"), "m9": (9, False, "mono"),
+        "m10b": (10, True, "mono"),
+    }
+    FAMILIES = {
+        "sans": ("Segoe UI", "SF Pro Text", "Helvetica Neue", "Ubuntu", "DejaVu Sans", "Helvetica"),
+        "mono": ("Consolas", "Menlo", "DejaVu Sans Mono", "Liberation Mono", "Courier New"),
     }
 
     def __init__(self, ctrl, server, hotkeys, ptt, start_hidden=False, start_fullscreen=False):
@@ -1550,7 +1698,9 @@ class GUI:
         self._maxed_size = None
         self._was_zoomed = False
         self._cfg_job = None
+        self._placed = False
         self.rec_key = "hotkey"
+        self.rec_which = "main"
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
@@ -1563,8 +1713,11 @@ class GUI:
         self.root.bind("<Configure>", self._on_configure)
 
         self._make_fonts()
+        self._set_icon()
         self._build()
         self._set_normal_size(force=True)
+        self.root.after(30, self._style_titlebar)
+        self.root.after(500, self._style_titlebar)
 
         # A bandeja não é usada no macOS (conflita com o tkinter)
         if SYSTEM != "Darwin":
@@ -1591,139 +1744,364 @@ class GUI:
             self.root.after(300, self._enter_fullscreen)
 
     # ---- construção -------------------------------------------------------
-    def _button(self, parent, text, command, bg=None):
+    def _set_icon(self):
+        """Ícone da janela (no lugar da pena padrão do Tk)."""
+        try:
+            import base64
+            import io
+
+            buf = io.BytesIO()
+            app_icon_image(64).save(buf, "PNG")
+            self._icon = self.tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+            self.root.iconphoto(True, self._icon)
+        except Exception:
+            pass
+
+    def _style_titlebar(self):
+        """Barra de título escura (minimizar, maximizar, fechar) no Windows 10/11."""
+        if SYSTEM != "Windows":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            self.root.update_idletasks()
+            user32, dwm = ctypes.windll.user32, ctypes.windll.dwmapi
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,
+                                                  ctypes.c_void_p, wintypes.DWORD]
+
+            def put(attr, value):
+                v = ctypes.c_int(value)
+                return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
+
+            def rgb(color):  # COLORREF = 0x00BBGGRR
+                return int(color[5:7], 16) << 16 | int(color[3:5], 16) << 8 | int(color[1:3], 16)
+
+            if put(20, 1) != 0:      # modo escuro (Windows 10 20H1+ e 11)
+                put(19, 1)           # versões mais antigas do Windows 10
+            put(35, rgb(self.BG))    # cor da barra (só Windows 11)
+            put(36, rgb(self.FG))    # cor do texto (só Windows 11)
+            put(34, rgb(self.BORDER))  # cor da borda (só Windows 11)
+            # força o Windows a redesenhar a barra de título
+            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0037)
+        except Exception:
+            pass
+
+    def _button(self, parent, text, command, kind="primary", small=False):
         tk = self.tk
-        bg = bg or self.ACCENT
-        lbl = tk.Label(parent, text=text, bg=bg, fg="white", padx=14, pady=6,
-                       font=self.fonts["h10b"], cursor="hand2")
+        styles = {
+            "primary": (self.ACCENT, "white", "#5b9bff"),
+            "ghost": (self.RAISED, self.FG, "#252c39"),
+            "green": (self.LIVE, "#04210f", "#52e394"),
+        }
+        bg, fg, hover = styles[kind]
+        px, py = (11, 5) if small else (16, 8)
+        lbl = tk.Label(parent, text=text, bg=bg, fg=fg, padx=self.S(px), pady=self.S(py),
+                       font=self.fonts["h9b" if small else "h10b"], cursor="hand2",
+                       highlightthickness=1,
+                       highlightbackground=self.BORDER if kind == "ghost" else bg,
+                       highlightcolor=self.BORDER if kind == "ghost" else bg)
         lbl.bind("<Button-1>", lambda e: command())
+        lbl.bind("<Enter>", lambda e: lbl.configure(bg=hover))
+        lbl.bind("<Leave>", lambda e: lbl.configure(bg=bg))
+        self._btns.append((lbl, px, py))
         return lbl
 
-    def _card(self, parent):
+    def _switch(self, parent, var, command=None):
+        """Chave liga/desliga desenhada no Canvas, ligada a uma BooleanVar."""
         tk = self.tk
-        frame = tk.Frame(parent, bg=self.CARD, padx=16, pady=14)
-        frame.pack(fill="x", padx=18, pady=(0, 12))
-        return frame
+        canvas = tk.Canvas(parent, bg=parent["bg"], highlightthickness=0, cursor="hand2")
 
+        def draw():
+            S = self.S
+            w, h = S(40), S(22)
+            canvas.configure(width=w, height=h)
+            canvas.delete("all")
+            on = bool(var.get())
+            r = h // 2
+            canvas.create_line(r, r, w - r, r, width=h - 1, capstyle="round",
+                               fill=self.LIVE if on else "#2a3140")
+            kx = w - r if on else r
+            kr = r - S(3)
+            canvas.create_oval(kx - kr, r - kr, kx + kr, r + kr,
+                               fill="#04210f" if on else "#aeb6c4", outline="")
+
+        def click(_event=None):
+            var.set(not var.get())
+            if command:
+                command()
+
+        canvas.bind("<Button-1>", click)
+        var.trace_add("write", lambda *a: draw())
+        draw()
+        self._redraws.append(draw)
+        return canvas
+
+    def _segmented(self, parent, items, on_click, font="h10b", expand=False):
+        tk = self.tk
+        track = tk.Frame(parent, bg=self.BG, padx=3, pady=3, highlightthickness=1,
+                         highlightbackground=self.BORDER, highlightcolor=self.BORDER)
+        btns = {}
+        for i, (key, text) in enumerate(items):
+            lbl = tk.Label(track, text=text, bg=self.BG, fg=self.DIM, font=self.fonts[font],
+                           padx=14, pady=6, cursor="hand2")
+            lbl.bind("<Button-1>", lambda e, k=key: on_click(k))
+            if expand:
+                lbl.grid(row=0, column=i, sticky="ew")
+                track.grid_columnconfigure(i, weight=1, uniform="seg")
+            else:
+                lbl.pack(side="left")
+            btns[key] = lbl
+        return track, btns
+
+    def _style_seg(self, btns, current):
+        for key, lbl in btns.items():
+            on = key == current
+            lbl.configure(bg=self.SEG_ON if on else self.BG, fg=self.SEG_ON_FG if on else self.DIM)
+
+    def _card(self, parent, title=None):
+        """Cartão com borda fina. Devolve o quadro interno; .head é a linha do título."""
+        tk = self.tk
+        card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
+                        highlightbackground=self.BORDER, highlightcolor=self.BORDER)
+        card.pack(fill="x")
+        inner = tk.Frame(card, bg=self.CARD)
+        inner.pack(fill="both", expand=True, padx=self.S(18), pady=self.S(16))
+        self._pads.append(inner)
+        inner.head = tk.Frame(inner, bg=self.CARD)
+        inner.head.pack(fill="x")
+        if title:
+            tk.Label(inner.head, text=title.upper(), bg=self.CARD, fg=self.DIM,
+                     font=self.fonts["cap"]).pack(side="left")
+        return inner
+
+    # ---- teclas (atalhos) -----------------------------------------------------
+    def _set_caps(self, frame, combo=None, note=None):
+        tk = self.tk
+        for w in frame.winfo_children():
+            w.destroy()
+        if note:
+            tk.Label(frame, text=note, bg=self.CARD, fg=self.SEG_ON_FG,
+                     font=self.fonts["h10b"]).pack(side="left")
+            return
+        parts = [p.strip() for p in pretty_combo(combo).split(" + ")]
+        for i, part in enumerate(parts):
+            if i:
+                tk.Label(frame, text="+", bg=self.CARD, fg=self.DIM,
+                         font=self.fonts["h9"]).pack(side="left", padx=self.S(4))
+            tk.Label(frame, text=part, bg=self.RAISED, fg=self.FG, font=self.fonts["m10b"],
+                     padx=self.S(10), pady=self.S(5), highlightthickness=1,
+                     highlightbackground="#2f3747", highlightcolor="#2f3747").pack(side="left")
+
+    def _render_caps(self):
+        if not hasattr(self, "hotkey_caps"):
+            return
+        ptt = self.cfg["mode"] == "ptt"
+        main_note = hold_note = None
+        if self.recording:
+            if self.rec_which == "hold":
+                hold_note = "Pressione a nova tecla…"
+            else:
+                main_note = "Pressione o novo atalho…"
+        self.hotkey_text = pretty_combo(self.cfg["ptt_hotkey" if ptt else "hotkey"])
+        self._set_caps(self.hotkey_caps, self.cfg["ptt_hotkey" if ptt else "hotkey"], main_note)
+        self._set_caps(self.hold_caps, self.cfg["ptt_hotkey"], hold_note)
+
+    # ---- construção -------------------------------------------------------
     def _build(self):
         tk = self.tk
+        S = self.S
+        self._pads, self._btns, self._redraws, self._sliders = [], [], [], []
+        self._full = False
+        self._orb_key = None
+        self.hotkey_text = ""
         self.container = tk.Frame(self.root, bg=self.BG)
         self.container.place(relx=0.5, rely=0.5, anchor="center")
-        self.panelA = tk.Frame(self.container, bg=self.BG)   # controle principal
-        self.panelB = tk.Frame(self.container, bg=self.BG)   # opções e celular
+        self.top = tk.Frame(self.container, bg=self.BG)
+        self.stacks = [tk.Frame(self.container, bg=self.BG) for _ in range(3)]
+        self.panelA = tk.Frame(self.container, bg=self.BG)   # círculo, modo e atalhos
+        self.panelB = tk.Frame(self.container, bg=self.BG)   # celular
         self.panelC = tk.Frame(self.container, bg=self.BG)   # redução de ruído
+        self.panelD = tk.Frame(self.container, bg=self.BG)   # opções
         self.msg = tk.Label(self.container, text="", bg=self.BG, fg=self.DIM,
-                            font=self.fonts["h9"], wraplength=340)
+                            font=self.fonts["h9"], wraplength=800, justify="center")
 
-        # ===== painel A: controle principal =====
-        A = self.panelA
-        self.top = tk.Frame(A, bg=self.BG)
-        self.top.pack(fill="x", padx=18, pady=(16, 6))
-        self.header = tk.Label(self.top, text=f"MUTINHO  v{APP_VERSION}", bg=self.BG, fg=self.DIM,
-                               font=self.fonts["h11b"])
-        self.header.pack(side="left")
-        self.fs_btn = self._button(self.top, "Tela cheia (F11)", self._toggle_fullscreen, bg="#4b5563")
-        self.fs_btn.pack(side="right", padx=(16, 0))
+        # ===== cabeçalho =====
+        self.logo = tk.Canvas(self.top, width=30, height=30, bg=self.BG, highlightthickness=0)
+        self.logo.pack(side="left")
+        self.header = tk.Label(self.top, text=APP_NAME, bg=self.BG, fg=self.FG, font=self.fonts["h16b"])
+        self.header.pack(side="left", padx=(10, 10))
+        self.version_pill = tk.Label(self.top, text=f"v{APP_VERSION}", bg=self.BG, fg=self.DIM,
+                                     font=self.fonts["m8"], padx=8, pady=1, highlightthickness=1,
+                                     highlightbackground=self.BORDER, highlightcolor=self.BORDER)
+        self.version_pill.pack(side="left")
+        self.fs_btn = self._button(self.top, "Tela cheia (F11)", self._toggle_fullscreen,
+                                   kind="ghost", small=True)
+        self.fs_btn.pack(side="right")
 
         # aviso de atualização (só aparece quando há versão nova)
-        self.update_bar = tk.Frame(A, bg="#14301f", padx=12, pady=8)
-        self.update_text = tk.Label(self.update_bar, text="", bg="#14301f", fg=self.FG,
-                                    font=self.fonts["h9b"])
-        self.update_text.pack(side="left", padx=(0, 10))
+        self.update_bar = tk.Frame(self.container, bg="#0f261a", padx=14, pady=10,
+                                   highlightthickness=1, highlightbackground="#1e5a39",
+                                   highlightcolor="#1e5a39")
+        self.update_text = tk.Label(self.update_bar, text="", bg="#0f261a", fg=self.FG,
+                                    font=self.fonts["h10b"])
+        self.update_text.pack(side="left", padx=(0, 12))
         self.update_btn = self._button(self.update_bar, "Atualizar agora", self._do_update,
-                                       bg=self.LIVE)
+                                       kind="green", small=True)
         self.update_btn.pack(side="right")
 
-        self.circle = tk.Canvas(A, width=160, height=160, bg=self.BG,
+        # ===== painel A: círculo, modo e atalhos =====
+        A = self.panelA
+        self.circle = tk.Canvas(A, width=S(self.ORB), height=S(self.ORB), bg=self.BG,
                                 highlightthickness=0, cursor="hand2")
         self.circle.pack()
-        self.circle_shape = self.circle.create_oval(10, 10, 150, 150, fill=self.LIVE, outline="")
-        self.circle_icon = self.circle.create_text(80, 80, text="🎙", font=self.fonts["h54"], fill="white")
         self.circle.bind("<ButtonPress-1>", self._circle_press)
         self.circle.bind("<ButtonRelease-1>", self._circle_release)
 
-        self.status = tk.Label(A, text="", bg=self.BG, fg=self.FG, font=self.fonts["h15b"])
-        self.status.pack(pady=(8, 10))
+        self.status = tk.Label(A, text="", bg=self.BG, fg=self.FG, font=self.fonts["h16b"])
+        self.status.pack(pady=(0, 2))
+        self.substatus = tk.Label(A, text="", bg=self.BG, fg=self.DIM, font=self.fonts["h9"])
+        self.substatus.pack(pady=(0, 14))
 
-        # seletor de modo
-        seg = tk.Frame(A, bg=self.CARD, padx=3, pady=3)
-        seg.pack(pady=(0, 12))
-        self.mode_btns = {}
-        for key, text in (("toggle", "Alternar"), ("ptt", "Apertar para falar")):
-            lbl = tk.Label(seg, text=text, padx=14, pady=6, font=self.fonts["h10b"], cursor="hand2")
-            lbl.bind("<Button-1>", lambda e, k=key: self._set_mode(k))
-            lbl.pack(side="left")
-            self.mode_btns[key] = lbl
+        track, self.mode_btns = self._segmented(
+            A, (("toggle", "Alternar"), ("ptt", "Apertar para falar")), self._set_mode, expand=True)
+        track.pack(fill="x", pady=(0, 14))
         self._style_mode()
 
-        # atalho (do modo atual)
-        card = self._card(A)
+        card = self._card(A, "Atalhos")
         self.hotkey_title = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, font=self.fonts["h9"])
-        self.hotkey_title.pack(anchor="w")
+        self.hotkey_title.pack(anchor="w", pady=(8, 6))
         row = tk.Frame(card, bg=self.CARD)
-        row.pack(fill="x", pady=(4, 0))
-        self.hotkey_label = tk.Label(row, text="", bg=self.CARD, fg=self.FG, font=self.fonts["h13b"])
-        self.hotkey_label.pack(side="left")
-        self.record_btn = self._button(row, "Alterar", lambda: self._start_recording("main"))
+        row.pack(fill="x")
+        self.hotkey_caps = tk.Frame(row, bg=self.CARD)
+        self.hotkey_caps.pack(side="left")
+        self.record_btn = self._button(row, "Alterar", lambda: self._start_recording("main"),
+                                       kind="ghost", small=True)
         self.record_btn.pack(side="right")
 
         # segunda tecla: falar segurando enquanto estiver mutado (só no modo alternar)
         self.hold_box = tk.Frame(card, bg=self.CARD)
         self.hold_title = tk.Label(self.hold_box, text="Falar enquanto mutado (segure)", bg=self.CARD,
                                    fg=self.DIM, font=self.fonts["h9"])
-        self.hold_title.pack(anchor="w", pady=(10, 0))
+        self.hold_title.pack(anchor="w", pady=(14, 6))
         hrow = tk.Frame(self.hold_box, bg=self.CARD)
-        hrow.pack(fill="x", pady=(4, 0))
-        self.hold_label = tk.Label(hrow, text="", bg=self.CARD, fg=self.FG, font=self.fonts["h13b"])
-        self.hold_label.pack(side="left")
-        self.hold_btn = self._button(hrow, "Alterar", lambda: self._start_recording("hold"))
+        hrow.pack(fill="x")
+        self.hold_caps = tk.Frame(hrow, bg=self.CARD)
+        self.hold_caps.pack(side="left")
+        self.hold_btn = self._button(hrow, "Alterar", lambda: self._start_recording("hold"),
+                                     kind="ghost", small=True)
         self.hold_btn.pack(side="right")
         self._update_hotkey_label()
 
-        # ===== painel B: opções e celular =====
-        B = self.panelB
-        card = self._card(B)
-        tk.Label(card, text="Controle pelo celular", bg=self.CARD, fg=self.DIM,
-                 font=self.fonts["h9"]).pack(anchor="w")
-        self.qr_canvas = tk.Canvas(card, bg="white", highlightthickness=0)
-        self.qr_canvas.pack(pady=(8, 6))
+        # ===== painel B: celular =====
+        card = self._card(self.panelB, "Controle pelo celular")
+        wrap = tk.Frame(card, bg="white", padx=S(10), pady=S(10))
+        wrap.pack(pady=(14, 10))
+        self.qr_wrap = wrap
+        self.qr_canvas = tk.Canvas(wrap, bg="white", highlightthickness=0)
+        self.qr_canvas.pack()
         self.url_label = tk.Label(card, text="", bg=self.CARD, fg=self.DIM,
-                                  font=self.fonts["h8"], wraplength=300)
+                                  font=self.fonts["m8"], wraplength=300)
         self.url_label.pack()
         tk.Label(card, text="Celular e PC precisam estar no mesmo Wi-Fi.", bg=self.CARD, fg=self.DIM,
-                 font=self.fonts["h8"]).pack(pady=(2, 8))
+                 font=self.fonts["h8"]).pack(pady=(4, 12))
         btns = tk.Frame(card, bg=self.CARD)
-        btns.pack()
-        self._button(btns, "Copiar link", self._copy_url).pack(side="left", padx=4)
-        self._button(btns, "Gerar novo link", self._new_link, bg="#4b5563").pack(side="left", padx=4)
-        self._draw_qr()
+        btns.pack(fill="x")
+        btns.grid_columnconfigure(0, weight=1, uniform="b")
+        btns.grid_columnconfigure(1, weight=1, uniform="b")
+        self._button(btns, "Copiar link", self._copy_url, kind="primary", small=True).grid(
+            row=0, column=0, sticky="ew", padx=(0, 5))
+        self._button(btns, "Gerar novo link", self._new_link, kind="ghost", small=True).grid(
+            row=0, column=1, sticky="ew", padx=(5, 0))
+        for lbl in btns.winfo_children():
+            lbl.configure(anchor="center")
 
-        # ===== painel C: redução de ruído =====
+        # ===== painéis C e D: ruído e opções =====
         self._build_noise(self.panelC)
-        self._build_options(self.panelC)
+        self._build_options(self.panelD)
 
         self._layout(False)
+        self._apply_sizes()
 
     def _build_options(self, parent):
         tk = self.tk
-        card = self._card(parent)
+        card = self._card(parent, "Opções")
         self.var_sound = tk.BooleanVar(value=bool(self.cfg["sound"]))
         self.var_top = tk.BooleanVar(value=bool(self.cfg["on_top"]))
         self.var_ind = tk.BooleanVar(value=bool(self.cfg["indicator"]))
         self.var_hidden = tk.BooleanVar(value=bool(self.cfg["start_hidden"]))
         self.var_auto = tk.BooleanVar(value=autostart_enabled())
         self.var_talkm = tk.BooleanVar(value=bool(self.cfg.get("talk_muted", True)))
-        for text, var, cmd in (
-            ("Segurar para falar estando mutado", self.var_talkm, self._opt_talk_muted),
+        rows = (
+            ("Falar mutado (segurar a tecla)", self.var_talkm, self._opt_talk_muted),
             ("Som ao mutar/desmutar", self.var_sound, self._opt_sound),
-            ("Manter janela sempre no topo", self.var_top, self._opt_top),
+            ("Sempre no topo", self.var_top, self._opt_top),
             ("Indicador flutuante na tela", self.var_ind, self._opt_indicator),
             ("Iniciar escondido na bandeja", self.var_hidden, self._opt_hidden),
             ("Iniciar junto com o computador", self.var_auto, self._opt_autostart),
-        ):
-            tk.Checkbutton(card, text=text, variable=var, command=cmd, bg=self.CARD, fg=self.FG,
-                           selectcolor=self.BG, activebackground=self.CARD, activeforeground=self.FG,
-                           highlightthickness=0, bd=0, anchor="w").pack(fill="x")
+        )
+        for i, (text, var, cmd) in enumerate(rows):
+            row = tk.Frame(card, bg=self.CARD)
+            row.pack(fill="x", pady=(10 if i == 0 else 0, 0))
+            tk.Label(row, text=text, bg=self.CARD, fg=self.FG, font=self.fonts["h10"]).pack(
+                side="left", pady=5)
+            self._switch(row, var, cmd).pack(side="right")
+
+    # ---- desenho: logo, círculo e microfone ----------------------------------
+    def _draw_mic(self, canvas, cx, cy, u, color, bg, muted):
+        """Microfone vetorial centrado em (cx, cy); u = 1/40 do raio do círculo."""
+        dy = 3 * u
+        w = max(2, int(3 * u))
+        canvas.create_oval(cx - 8 * u, cy - 26 * u + dy, cx + 8 * u, cy - 10 * u + dy, fill=color, outline="")
+        canvas.create_rectangle(cx - 8 * u, cy - 18 * u + dy, cx + 8 * u, cy - 4 * u + dy, fill=color, outline="")
+        canvas.create_oval(cx - 8 * u, cy - 12 * u + dy, cx + 8 * u, cy + 4 * u + dy, fill=color, outline="")
+        canvas.create_arc(cx - 15 * u, cy - 19 * u + dy, cx + 15 * u, cy + 11 * u + dy, start=180,
+                          extent=180, style="arc", outline=color, width=w)
+        canvas.create_line(cx, cy + 11 * u + dy, cx, cy + 19 * u + dy, fill=color, width=w)
+        canvas.create_line(cx - 8 * u, cy + 19 * u + dy, cx + 8 * u, cy + 19 * u + dy, fill=color,
+                           width=w, capstyle="round")
+        if muted:
+            canvas.create_line(cx - 22 * u, cy - 22 * u, cx + 22 * u, cy + 22 * u, fill=bg,
+                               width=max(3, int(9 * u)), capstyle="round")
+            canvas.create_line(cx - 22 * u, cy - 22 * u, cx + 22 * u, cy + 22 * u, fill=color,
+                               width=max(2, int(4 * u)), capstyle="round")
+
+    def _draw_logo(self):
+        size = self.S(30)
+        c = self.logo
+        c.configure(width=size, height=size)
+        c.delete("all")
+        _round_rect(c, 1, 1, size - 1, size - 1, size * 0.28, fill=self.LIVE, outline="")
+        self._draw_mic(c, size / 2, size / 2, size / 62.0, "#07140d", self.LIVE, False)
+
+    def _draw_orb(self):
+        c = self.circle
+        size = self.S(self.ORB)
+        color = self.MUTE if self.muted else self.LIVE
+        key = (color, size)
+        if key == self._orb_key:
+            return
+        self._orb_key = key
+        c.delete("all")
+        cx = cy = size / 2
+        core = size * 0.31
+        rings = 10
+        outer = size / 2 - 1
+        inner = core * 1.16
+        for i in range(rings):
+            r = outer - (outer - inner) * i / rings
+            t = 0.95 - 0.30 * (i / (rings - 1))
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=_blend(color, self.BG, t), outline="")
+        c.create_oval(cx - inner, cy - inner, cx + inner, cy + inner, fill=self.BG,
+                      outline=_blend(color, self.BG, 0.45), width=max(2, self.S(2)))
+        c.create_oval(cx - core, cy - core, cx + core, cy + core, fill=color,
+                      outline=_blend(color, "#ffffff", 0.3), width=max(2, self.S(2)))
+        self._draw_mic(c, cx, cy, core / 34.0, "white", color, self.muted)
 
     # ---- QR ---------------------------------------------------------------
     def _draw_qr(self):
@@ -1734,7 +2112,7 @@ class GUI:
         qr.add_data(url)
         qr.make(fit=True)
         matrix = qr.get_matrix()
-        cell = max(2, self.S(200) // len(matrix))
+        cell = max(2, self.S(self.QR) // len(matrix))
         size = cell * len(matrix)
         self.qr_canvas.delete("all")
         self.qr_canvas.configure(width=size, height=size)
@@ -1783,10 +2161,7 @@ class GUI:
             self.ctrl.talk_async(False)
 
     def _style_mode(self):
-        current = self.ctrl.get_mode()
-        for key, lbl in self.mode_btns.items():
-            on = key == current
-            lbl.configure(bg=self.ACCENT if on else self.CARD, fg="white" if on else self.DIM)
+        self._style_seg(self.mode_btns, self.ctrl.get_mode())
 
     def _set_mode(self, mode):
         if mode == self.ctrl.get_mode():
@@ -1821,8 +2196,7 @@ class GUI:
     def _update_hotkey_label(self):
         ptt = self.cfg["mode"] == "ptt"
         self.hotkey_title.configure(text="Tecla para falar (segure)" if ptt else "Atalho global")
-        self.hotkey_label.configure(text=pretty_combo(self.cfg["ptt_hotkey" if ptt else "hotkey"]))
-        self.hold_label.configure(text=pretty_combo(self.cfg["ptt_hotkey"]))
+        self._render_caps()
         if not ptt and self.cfg.get("talk_muted", True):
             self.hold_box.pack(fill="x")
         else:
@@ -1830,17 +2204,29 @@ class GUI:
         self._set_normal_size()
 
     # ---- fontes, escala e tela cheia ---------------------------------------
+    def _pick_family(self, kind):
+        try:
+            have = set(self.tkfont.families(self.root))
+        except Exception:
+            have = set()
+        for name in self.FAMILIES[kind]:
+            if name in have:
+                return name
+        return self.FAMILIES[kind][-1]
+
     def _make_fonts(self):
         tkfont = self.tkfont
+        fam = {k: self._pick_family(k) for k in self.FAMILIES}
         self.fonts = {}
-        for name, (size, bold) in self.FONT_SPECS.items():
-            self.fonts[name] = tkfont.Font(root=self.root, family="Helvetica", size=size,
+        for name, (size, bold, kind) in self.FONT_SPECS.items():
+            self.fonts[name] = tkfont.Font(root=self.root, family=fam[kind], size=size,
                                            weight="bold" if bold else "normal")
-        # fontes padrão do Tk (caixas de seleção, menus) também precisam escalar
+        # fontes padrão do Tk (menus, caixas) também precisam escalar
         self.default_fonts = []
         for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
             try:
                 f = tkfont.nametofont(fname)
+                f.configure(family=fam["sans"])
                 self.default_fonts.append((f, abs(int(f.cget("size"))) or 9))
             except Exception:
                 pass
@@ -1850,7 +2236,7 @@ class GUI:
 
     def _set_scale(self, scale):
         self.scale = scale
-        for name, (size, _bold) in self.FONT_SPECS.items():
+        for name, (size, _bold, _kind) in self.FONT_SPECS.items():
             self.fonts[name].configure(size=max(6, round(size * scale)))
         for f, base in self.default_fonts:
             f.configure(size=max(6, round(base * scale)))
@@ -1858,39 +2244,61 @@ class GUI:
 
     def _apply_sizes(self):
         S = self.S
-        size = S(160)
-        self.circle.configure(width=size, height=size)
-        self.circle.coords(self.circle_shape, S(10), S(10), size - S(10), size - S(10))
-        self.circle.coords(self.circle_icon, size // 2, size // 2)
-        self.url_label.configure(wraplength=S(300))
-        self.msg.configure(wraplength=S(900) if self.fullscreen else 340)
+        if not hasattr(self, "panelD"):
+            return
+        self.container.configure(padx=S(26), pady=S(20))
+        for inner in self._pads:
+            inner.pack_configure(padx=S(18), pady=S(16))
+        for lbl, px, py in self._btns:
+            lbl.configure(padx=S(px), pady=S(py))
+        for redraw in self._redraws:
+            redraw()
+        for slider in self._sliders:
+            slider.resize()
+        self.circle.configure(width=S(self.ORB), height=S(self.ORB))
+        self._orb_key = None
+        self._draw_orb()
+        self._draw_logo()
+        self.qr_wrap.configure(padx=S(10), pady=S(10))
+        self.url_label.configure(wraplength=S(self.CW - 90))
+        self._layout(self._full)
         self._draw_qr()
-        if hasattr(self, "ns_scale"):
-            self.ns_scale.configure(length=S(290), sliderlength=S(22), width=S(14))
-            self.ns_meter.configure(width=S(290), height=S(36))
-            self.ns_status.configure(wraplength=S(290))
-            self.ns_help.configure(wraplength=S(290))
+        self._render_caps()
+        if hasattr(self, "ns_meter"):
+            self.ns_meter.configure(height=S(44))
+            self.ns_status.configure(wraplength=S(self.CW - 40))
+            self.ns_help.configure(wraplength=S(self.CW - 40))
 
     def _layout(self, full):
         S = self.S
-        for w in (self.panelA, self.panelB, self.panelC, self.msg):
+        self._full = full
+        for w in (self.top, self.msg, *self.stacks):
             w.grid_forget()
-        for col in range(3):
-            self.container.grid_columnconfigure(col, minsize=0)
+        for p in (self.panelA, self.panelB, self.panelC, self.panelD):
+            p.pack_forget()
+        gap = S(14)
+        s1, s2, s3 = self.stacks
+        self.top.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, S(16)))
+        if self.update_info:
+            self.update_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, S(14)), padx=S(7))
         if full:
-            # três colunas lado a lado, ocupando a tela
-            self.panelA.grid(row=0, column=0, sticky="n", padx=S(8))
-            self.panelB.grid(row=0, column=1, sticky="n", padx=S(8))
-            self.panelC.grid(row=0, column=2, sticky="n", padx=S(8))
-            self.msg.grid(row=1, column=0, columnspan=3, pady=(S(8), 0))
-            for col in range(3):
-                self.container.grid_columnconfigure(col, minsize=S(340))
+            self.panelA.pack(in_=s1, fill="x")
+            self.panelC.pack(in_=s2, fill="x")
+            self.panelB.pack(in_=s3, fill="x", pady=(0, gap))
+            self.panelD.pack(in_=s3, fill="x")
+            for i, s in enumerate(self.stacks):
+                s.grid(row=2, column=i, sticky="new", padx=S(7))
         else:
-            self.panelA.grid(row=0, column=0, sticky="n")
-            self.panelB.grid(row=1, column=0, sticky="n")
-            self.panelC.grid(row=0, column=1, rowspan=2, sticky="n", pady=(44, 0), padx=(0, 6))
-            self.msg.grid(row=2, column=0, columnspan=2, pady=(0, 12))
-            self.container.grid_columnconfigure(0, minsize=340)
+            self.panelA.pack(in_=s1, fill="x", pady=(0, gap))
+            self.panelB.pack(in_=s1, fill="x")
+            self.panelC.pack(in_=s2, fill="x", pady=(0, gap))
+            self.panelD.pack(in_=s2, fill="x")
+            s1.grid(row=2, column=0, sticky="new", padx=S(7))
+            s2.grid(row=2, column=1, sticky="new", padx=S(7))
+        self.msg.grid(row=3, column=0, columnspan=3, pady=(S(16), 0))
+        self.msg.configure(wraplength=S(self.CW * (3 if full else 2)))
+        for col in range(3):
+            self.container.grid_columnconfigure(col, minsize=S(self.CW) if col < (3 if full else 2) else 0)
 
     def _fit_to_area(self, aw, ah):
         """Escolhe o maior zoom (1x a 2,2x) em que as três colunas cabem na área dada."""
@@ -1899,30 +2307,59 @@ class GUI:
         root.update_idletasks()
         w = max(1, self.container.winfo_reqwidth())
         h = max(1, self.container.winfo_reqheight())
-        scale = max(1.0, min(2.2, aw * 0.94 / w, ah * 0.94 / h))
+        scale = max(0.6, min(2.2, aw * 0.94 / w, ah * 0.94 / h))
         for _ in range(8):
             self._set_scale(scale)
             root.update_idletasks()
             fits = (self.container.winfo_reqwidth() <= aw * 0.97
                     and self.container.winfo_reqheight() <= ah * 0.97)
-            if fits or scale <= 1.0:
+            if fits or scale <= 0.6:
                 break
-            scale = max(1.0, scale * 0.92)
+            scale = max(0.6, scale * 0.92)
 
     def _fit_to_screen(self):
         self._fit_to_area(self.root.winfo_screenwidth(), self.root.winfo_screenheight())
 
     # ---- tamanho da janela e botão de maximizar -----------------------------
+    def _fit_normal(self):
+        """Janela normal: zoom 1x, ou menor se o conteúdo não couber na tela."""
+        root = self.root
+        self._set_scale(1.0)
+        root.update_idletasks()
+        aw = root.winfo_screenwidth() - 60
+        ah = root.winfo_screenheight() - 110   # barra de tarefas + barra de título
+        w = max(1, self.container.winfo_reqwidth())
+        h = max(1, self.container.winfo_reqheight())
+        scale = min(1.0, aw / w, ah / h)
+        if scale >= 0.995:
+            return
+        scale = max(0.6, scale)
+        for _ in range(8):
+            self._set_scale(scale)
+            root.update_idletasks()
+            if (self.container.winfo_reqwidth() <= aw and self.container.winfo_reqheight() <= ah) \
+                    or scale <= 0.6:
+                break
+            scale = max(0.6, scale * 0.95)
+
     def _set_normal_size(self, force=False):
-        """Tamanho mínimo = o conteúdo. Com force, também volta ao tamanho natural."""
+        """Tamanho mínimo = o conteúdo. Com force, ajusta o zoom à tela e volta ao tamanho natural."""
         if self.fullscreen or self.maxed:
             return
+        if force:
+            self._fit_normal()
         self.root.update_idletasks()
-        w = self.container.winfo_reqwidth() + 32
-        h = self.container.winfo_reqheight() + 20
+        w = self.container.winfo_reqwidth()
+        h = self.container.winfo_reqheight()
         self.root.minsize(w, h)
         if force:
-            self.root.geometry(f"{w}x{h}")
+            if not self._placed:
+                self._placed = True
+                x = max(0, (self.root.winfo_screenwidth() - w) // 2)
+                y = max(0, (self.root.winfo_screenheight() - h) // 2 - 20)
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
+            else:
+                self.root.geometry(f"{w}x{h}")
         else:
             cw, ch = self.root.winfo_width(), self.root.winfo_height()
             if cw > 1 and (cw < w or ch < h):
@@ -2015,9 +2452,13 @@ class GUI:
             text = "Segure para falar" if self.muted else "FALANDO…"
         else:
             text = "Microfone MUTADO" if self.muted else "Microfone LIGADO"
-        self.circle.itemconfigure(self.circle_shape, fill=color)
-        self.circle.itemconfigure(self.circle_icon, text="🔇" if self.muted else "🎙")
+        self._draw_orb()
         self.status.configure(text=text, fg=color)
+        if self.ctrl.get_mode() == "ptt":
+            hint = "Segure a tecla ou o círculo para falar" if self.muted else "Solte para voltar ao mudo"
+        else:
+            hint = "Toque no círculo ou use o atalho para " + ("desmutar" if self.muted else "mutar")
+        self.substatus.configure(text=hint)
         if self.indicator is not None:
             self.indicator_label.configure(
                 text="● MUTADO" if self.muted else "● MIC LIGADO", fg=color)
@@ -2085,12 +2526,8 @@ class GUI:
             self._say(f"Não foi possível gravar o atalho: {exc}")
             return
         self.recording = True
-        if which == "hold":
-            self.hold_label.configure(text="Pressione a nova tecla…")
-            self.hold_btn.configure(text="Gravando…")
-        else:
-            self.hotkey_label.configure(text="Pressione o novo atalho…")
-            self.record_btn.configure(text="Gravando…")
+        self._render_caps()
+        (self.hold_btn if which == "hold" else self.record_btn).configure(text="Gravando…")
 
     def _apply_hotkey(self, combo):
         self.recording = False
@@ -2186,7 +2623,9 @@ class GUI:
         self.update_info = info
         self.update_text.configure(text=f"Nova versão {info['version']} disponível")
         self.update_btn.configure(text="Atualizar agora" if can_self_update() else "Baixar no site")
-        self.update_bar.pack(after=self.top, fill="x", padx=18, pady=(0, 6))
+        self.update_bar.grid(row=1, column=0, columnspan=3, sticky="ew", padx=self.S(7),
+                             pady=(0, self.S(14)))
+        self._set_normal_size()
         notes = info.get("notes")
         if notes:
             self._say(f"Novidades: {notes}")
@@ -2213,103 +2652,118 @@ class GUI:
 
     # ---- redução de ruído -------------------------------------------------
     def _style_menu(self, menu_button):
-        menu_button.configure(bg=self.BG, fg=self.FG, activebackground=self.ACCENT,
-                              activeforeground="white", highlightthickness=0, bd=0,
-                              relief="flat", anchor="w", width=34)
+        menu_button.configure(bg=self.INPUT, fg=self.FG, activebackground=self.RAISED,
+                              activeforeground=self.FG, highlightthickness=1,
+                              highlightbackground=self.BORDER, highlightcolor=self.BORDER,
+                              bd=0, relief="flat", anchor="w", width=12, padx=10, pady=7,
+                              cursor="hand2")
         menu_button["menu"].configure(bg=self.CARD, fg=self.FG, activebackground=self.ACCENT,
-                                      activeforeground="white", bd=0)
+                                      activeforeground="white", bd=0, relief="flat")
+
+    def _field_label(self, parent, text, pady=(14, 5)):
+        lbl = self.tk.Label(parent, text=text, bg=self.CARD, fg=self.DIM, font=self.fonts["h9"])
+        lbl.pack(anchor="w", pady=pady)
+        return lbl
 
     def _build_noise(self, parent):
         tk = self.tk
         self.ns = NoiseSuppressor(self.ctrl)
         self.ns.set_mode(self.cfg.get("ns_mode", "ai"))
-        card = self._card(parent)
-        tk.Label(card, text="Redução de ruído", bg=self.CARD, fg=self.DIM,
-                 font=self.fonts["h9"]).pack(anchor="w")
+        card = self._card(parent, "Redução de ruído")
 
         ok, _err = NoiseSuppressor.available()
         if not ok:
             tk.Label(card, text="Recurso opcional. Para ativar, instale as bibliotecas:\n\n"
                                 "python -m pip install numpy sounddevice\n\n"
                                 "e abra o Mutinho de novo.",
-                     bg=self.CARD, fg=self.DIM, justify="left", wraplength=290,
-                     font=self.fonts["h9"]).pack(anchor="w", pady=(8, 0))
+                     bg=self.CARD, fg=self.DIM, justify="left", wraplength=self.CW - 40,
+                     font=self.fonts["h9"]).pack(anchor="w", pady=(10, 0))
             return
 
         self.var_ns = tk.BooleanVar(value=False)
-        tk.Checkbutton(card, text="Ativar redução de ruído", variable=self.var_ns,
-                       command=self._ns_toggle, bg=self.CARD, fg=self.FG, selectcolor=self.BG,
-                       activebackground=self.CARD, activeforeground=self.FG,
-                       highlightthickness=0, bd=0, anchor="w").pack(fill="x", pady=(6, 0))
+        self._switch(card.head, self.var_ns, self._ns_toggle).pack(side="right")
 
-        seg = tk.Frame(card, bg=self.BG, padx=2, pady=2)
-        seg.pack(anchor="w", pady=(8, 0))
-        self.ns_mode_btns = {}
-        for key, text in (("ai", "IA (RNNoise)"), ("classic", "Clássico")):
-            lbl = tk.Label(seg, text=text, padx=12, pady=4, font=self.fonts["h9b"], cursor="hand2")
-            lbl.bind("<Button-1>", lambda e, k=key: self._ns_set_mode(k))
-            lbl.pack(side="left")
-            self.ns_mode_btns[key] = lbl
+        track, self.ns_mode_btns = self._segmented(
+            card, (("ai", "IA (RNNoise)"), ("classic", "Clássico")), self._ns_set_mode,
+            font="h9b", expand=True)
+        track.pack(fill="x", pady=(12, 0))
         self._style_ns_mode()
 
-        self.ns_label = tk.Label(card, text="", bg=self.CARD, fg=self.FG,
-                                 font=self.fonts["h10b"])
-        self.ns_label.pack(anchor="w", pady=(8, 0))
-        self.ns_scale = tk.Scale(card, from_=0, to=100, orient="horizontal", showvalue=False,
-                                 length=290, command=self._ns_intensity, bg=self.CARD, fg=self.FG,
-                                 troughcolor=self.BG, highlightthickness=0, bd=0, sliderlength=22,
-                                 width=14, activebackground=self.ACCENT)
-        self.ns_scale.set(int(self.cfg["ns_intensity"]))
-        self.ns_scale.bind("<ButtonRelease-1>", lambda e: self._ns_save_intensity())
-        self.ns_scale.pack(fill="x")
+        row = tk.Frame(card, bg=self.CARD)
+        row.pack(fill="x", pady=(16, 0))
+        tk.Label(row, text="Intensidade", bg=self.CARD, fg=self.DIM, font=self.fonts["h9"]).pack(side="left")
+        self.ns_label = tk.Label(row, text="", bg=self.CARD, fg=self.FG, font=self.fonts["m10b"])
+        self.ns_label.pack(side="right")
+        self.ns_scale = _Slider(self, card, self.CARD, 0, 100, int(self.cfg["ns_intensity"]),
+                                self._ns_intensity, self._ns_save_intensity)
+        self.ns_scale.pack(fill="x", pady=(2, 0))
         ends = tk.Frame(card, bg=self.CARD)
         ends.pack(fill="x")
         tk.Label(ends, text="Leve", bg=self.CARD, fg=self.DIM, font=self.fonts["h8"]).pack(side="left")
         tk.Label(ends, text="Forte", bg=self.CARD, fg=self.DIM, font=self.fonts["h8"]).pack(side="right")
+        self._ns_intensity(self.ns_scale.get())
 
-        tk.Label(card, text="Seu microfone", bg=self.CARD, fg=self.DIM,
-                 font=self.fonts["h9"]).pack(anchor="w", pady=(10, 2))
+        self._field_label(card, "Seu microfone")
         self.ns_in = tk.StringVar()
         self.ns_in_menu = tk.OptionMenu(card, self.ns_in, "")
         self._style_menu(self.ns_in_menu)
         self.ns_in_menu.pack(fill="x")
 
-        tk.Label(card, text="Enviar o áudio limpo para (microfone virtual)", bg=self.CARD, fg=self.DIM,
-                 font=self.fonts["h9"]).pack(anchor="w", pady=(10, 2))
+        self._field_label(card, "Enviar o áudio limpo para (microfone virtual)")
         self.ns_out = tk.StringVar()
         self.ns_out_menu = tk.OptionMenu(card, self.ns_out, "")
         self._style_menu(self.ns_out_menu)
         self.ns_out_menu.pack(fill="x")
 
+        self.ns_meter = tk.Canvas(card, height=44, bg=self.CARD, highlightthickness=0)
+        self.ns_meter.pack(fill="x", pady=(14, 0))
+
+        tk.Frame(card, bg=self.BORDER, height=1).pack(fill="x", pady=(14, 14))
+
+        # ouvir a própria voz
+        mrow = tk.Frame(card, bg=self.CARD)
+        mrow.pack(fill="x")
+        mtxt = tk.Frame(mrow, bg=self.CARD)
+        mtxt.pack(side="left")
+        tk.Label(mtxt, text="Ouvir minha própria voz", bg=self.CARD, fg=self.FG,
+                 font=self.fonts["h10b"]).pack(anchor="w")
+        tk.Label(mtxt, text="Use fones para não dar eco", bg=self.CARD, fg=self.DIM,
+                 font=self.fonts["h8"]).pack(anchor="w")
         self.var_mon = tk.BooleanVar(value=False)
-        tk.Checkbutton(card, text="Ouvir minha própria voz (use fones)", variable=self.var_mon,
-                       command=self._mon_toggle, bg=self.CARD, fg=self.FG, selectcolor=self.BG,
-                       activebackground=self.CARD, activeforeground=self.FG,
-                       highlightthickness=0, bd=0, anchor="w").pack(fill="x", pady=(12, 0))
+        self._switch(mrow, self.var_mon, self._mon_toggle).pack(side="right")
+
+        self._field_label(card, "Fones de ouvido")
         self.mon_out = tk.StringVar()
         self.mon_out_menu = tk.OptionMenu(card, self.mon_out, "")
         self._style_menu(self.mon_out_menu)
-        self.mon_out_menu.pack(fill="x", pady=(4, 0))
+        self.mon_out_menu.pack(fill="x")
 
-        self.ns_meter = tk.Canvas(card, width=290, height=36, bg=self.CARD, highlightthickness=0)
-        self.ns_meter.pack(pady=(12, 0))
+        vrow = tk.Frame(card, bg=self.CARD)
+        vrow.pack(fill="x", pady=(14, 0))
+        tk.Label(vrow, text="Volume", bg=self.CARD, fg=self.DIM, font=self.fonts["h9"]).pack(side="left")
+        self.mon_vol_label = tk.Label(vrow, text="", bg=self.CARD, fg=self.FG, font=self.fonts["m10b"])
+        self.mon_vol_label.pack(side="right")
+        self.mon_scale = _Slider(self, card, self.CARD, 0, 100, int(self.cfg.get("monitor_vol", 60)),
+                                 self._mon_volume, self._mon_save_volume)
+        self.mon_scale.pack(fill="x", pady=(2, 0))
+        self._mon_volume(self.mon_scale.get())
 
-        self.ns_status = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=290,
+        self.ns_status = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=self.CW - 40,
                                   justify="left", font=self.fonts["h9b"])
-        self.ns_status.pack(anchor="w", pady=(6, 0))
-        self.ns_help = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=290,
+        self.ns_status.pack(anchor="w", pady=(12, 0))
+        self.ns_help = tk.Label(card, text="", bg=self.CARD, fg=self.DIM, wraplength=self.CW - 40,
                                 justify="left", font=self.fonts["h8"])
-        self.ns_help.pack(anchor="w", pady=(4, 8))
+        self.ns_help.pack(anchor="w", pady=(4, 12))
         self._button(card, "Atualizar dispositivos", self._ns_refresh_devices,
-                     bg="#4b5563").pack(anchor="w")
+                     kind="ghost", small=True).pack(anchor="w")
 
         self._ns_refresh_devices()
         if self.cfg["ns_enabled"]:
             self.var_ns.set(True)
             self._ns_toggle()
-            if self.cfg.get("monitor") and self.ns.running:
-                self.var_mon.set(True)
-                self._mon_toggle()
+        if self.cfg.get("monitor"):
+            self.var_mon.set(True)
+            self._mon_toggle()
         self.root.after(200, self._ns_meter)
 
     def _fill_menu(self, menu_button, var, names, preferred, fallback_first, pick=None):
@@ -2358,12 +2812,11 @@ class GUI:
         self.cfg["ns_out"] = self.ns_out.get()
         if self.var_ns.get():
             self._ns_toggle()  # reinicia com os dispositivos novos
+        elif self.var_mon.get():
+            self._mon_toggle()
 
     def _style_ns_mode(self):
-        current = self.cfg.get("ns_mode", "ai")
-        for key, lbl in self.ns_mode_btns.items():
-            on = key == current
-            lbl.configure(bg=self.ACCENT if on else self.CARD, fg="white" if on else self.DIM)
+        self._style_seg(self.ns_mode_btns, self.cfg.get("ns_mode", "ai"))
 
     def _ns_set_mode(self, mode):
         if mode == self.cfg.get("ns_mode", "ai"):
@@ -2389,21 +2842,31 @@ class GUI:
 
     def _mon_toggle(self):
         if self.var_mon.get():
-            err = self.ns.set_monitor(self.mon_out.get())
+            err = self.ns.set_monitor(self.mon_out.get(), self.ns_in.get())
             if err:
                 self.var_mon.set(False)
                 self.cfg["monitor"] = False
                 self.ns_status.configure(text=err, fg=self.MUTE)
                 return
             self.cfg["monitor"] = True
-            self.ns_status.configure(text="Você está ouvindo a sua voz já limpa. Use fones para não dar eco.",
-                                     fg=self.LIVE)
+            self.ns_status.configure(
+                text="Você está ouvindo a sua voz"
+                     + (" já limpa." if self.ns.running else " (microfone direto).")
+                     + " Use fones para não dar eco.", fg=self.LIVE)
         else:
             self.ns.set_monitor(None)
             self.cfg["monitor"] = False
-            if self.ns.running:
-                self.ns_status.configure(text="Ativo: seu áudio está sendo limpo"
-                                              + (" pela IA." if self.ns.active_mode == "ai" else "."), fg=self.LIVE)
+            self.ns_status.configure(
+                text=("Ativo: seu áudio está sendo limpo" + (" pela IA." if self.ns.active_mode == "ai" else "."))
+                if self.ns.running else "", fg=self.LIVE if self.ns.running else self.DIM)
+
+    def _mon_volume(self, value):
+        v = int(float(value))
+        self.ns.set_monitor_volume(v)
+        self.mon_vol_label.configure(text=f"{v}%")
+
+    def _mon_save_volume(self):
+        self.cfg["monitor_vol"] = int(self.mon_scale.get())
 
     def _ns_toggle(self):
         if self.var_ns.get():
@@ -2423,16 +2886,16 @@ class GUI:
                 self._mon_toggle()  # reabre o retorno junto com o novo fluxo
         else:
             self.ns.stop()
-            self.var_mon.set(False)
-            self.cfg["monitor"] = False
             self.cfg["ns_enabled"] = False
             self.ns_status.configure(text="", fg=self.DIM)
+            if self.var_mon.get():
+                self._mon_toggle()  # continua ouvindo, agora direto do microfone
 
     def _ns_intensity(self, value):
         v = int(float(value))
         self.ns.set_intensity(v)
         nivel = "desligado" if v == 0 else "leve" if v < 35 else "médio" if v < 70 else "forte"
-        self.ns_label.configure(text=f"Intensidade: {v}%  ({nivel})")
+        self.ns_label.configure(text=f"{v}% · {nivel}")
 
     def _ns_save_intensity(self):
         self.cfg["ns_intensity"] = int(self.ns_scale.get())
@@ -2443,17 +2906,20 @@ class GUI:
         S = self.S
         canvas = self.ns_meter
         canvas.delete("all")
-        width = S(290)
-        rows = (("Entrada", self.ns.in_level, "#6b7280"), ("Saída", self.ns.out_level, self.LIVE))
+        width = max(canvas.winfo_width(), S(200))
+        rows = (("Entrada", self.ns.in_level, "#5f7088"), ("Saída", self.ns.out_level, self.LIVE))
+        left = S(58)
         for i, (label, level, color) in enumerate(rows):
-            y = S(4) + i * S(16)
+            y = S(6) + i * S(20)
             frac = 0.0
             if self.ns.running:
                 frac = min(1.0, max(0.0, (20 * math.log10(max(level, 1e-5)) + 60) / 60))
-            canvas.create_text(0, y + S(5), text=label, anchor="w", fill=self.DIM, font=self.fonts["h8"])
-            canvas.create_rectangle(S(52), y, width, y + S(10), fill=self.BG, outline="")
-            canvas.create_rectangle(S(52), y, S(52) + int((width - S(52)) * frac), y + S(10),
-                                    fill=color, outline="")
+            canvas.create_text(0, y + S(4), text=label, anchor="w", fill=self.DIM, font=self.fonts["h8"])
+            canvas.create_line(left, y + S(4), width - S(2), y + S(4), width=S(7), capstyle="round",
+                               fill="#1b2029")
+            if frac > 0.02:
+                canvas.create_line(left, y + S(4), left + (width - S(2) - left) * frac, y + S(4),
+                                   width=S(7), capstyle="round", fill=color)
         self.root.after(100, self._ns_meter)
 
     def show(self):
