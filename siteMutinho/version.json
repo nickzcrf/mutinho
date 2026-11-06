@@ -1,6 +1,6 @@
 {
-  "version": "1.6.1",
+  "version": "1.6.2",
   "url": "dist/Mutinho.exe",
-  "sha256": "d2d62c3998044e34873fdf2a5e90388b63743c1a07035a980e4cabe3055976c2",
-  "notes": "Interface nova e volume da voz"
+  "sha256": "68306ce0e4fc887c57611e1efeae5f0dd6d58d5e34701c7dfe5b3d3910d5264a",
+  "notes": "Atalhos com mouse, Esc cancela, tela mais nítida, troca de tela suave"
 }

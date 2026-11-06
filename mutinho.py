@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 # Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
 # Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
 UPDATE_URL = "https://mutinho.vercel.app/version.json"
@@ -382,27 +382,25 @@ class Controller:
 # --------------------------------------------------------------------------
 # Atalho global
 # --------------------------------------------------------------------------
-class HotkeyManager:
-    def __init__(self, callback):
-        self.callback = callback
-        self.listener = None
+# Botões do mouse aceitos em atalhos (o esquerdo e o direito ficam livres para a interface)
+MOUSE_TOKENS = {
+    "<mouse_middle>": "Mouse (meio)",
+    "<mouse_back>": "Mouse (lateral voltar)",
+    "<mouse_forward>": "Mouse (lateral avançar)",
+}
+_MOUSE_BY_NAME = {
+    "middle": "<mouse_middle>",
+    "x1": "<mouse_back>", "button8": "<mouse_back>",
+    "x2": "<mouse_forward>", "button9": "<mouse_forward>",
+}
 
-    def start(self, combo):
-        from pynput import keyboard
 
-        keyboard.HotKey.parse(combo)  # levanta ValueError se for inválido
-        self.stop()
-        self.listener = keyboard.GlobalHotKeys({combo: self.callback})
-        self.listener.daemon = True
-        self.listener.start()
+def _mouse_token(button):
+    return _MOUSE_BY_NAME.get(getattr(button, "name", "") or str(button))
 
-    def stop(self):
-        if self.listener is not None:
-            try:
-                self.listener.stop()
-            except Exception:
-                pass
-            self.listener = None
+
+def combo_has_mouse(combo):
+    return any(part in MOUSE_TOKENS for part in combo.split("+"))
 
 
 class ComboTracker:
@@ -430,43 +428,121 @@ class ComboTracker:
             self.on_up()
 
 
-class PushToTalk:
-    """Tecla global de apertar para falar: on_change(True) ao apertar, on_change(False) ao soltar."""
+class ComboListener:
+    """Escuta teclas e botões do mouse ao mesmo tempo (atalhos como Ctrl+botão lateral)."""
 
-    def __init__(self, on_change):
-        self.on_change = on_change
-        self.listener = None
+    def __init__(self):
+        self.kl = None
+        self.ml = None
         self.tracker = None
+
+    @property
+    def active(self):
+        return self.tracker is not None and self.tracker.active
+
+    def start(self, combo, on_down, on_up):
+        from pynput import keyboard, mouse
+
+        parts = [p for p in combo.split("+") if p]
+        mouse_parts = [p for p in parts if p in MOUSE_TOKENS]
+        key_parts = [p for p in parts if p not in MOUSE_TOKENS]
+        keys = set(keyboard.HotKey.parse("+".join(key_parts))) if key_parts else set()
+        keys |= set(mouse_parts)
+        if not keys:
+            raise ValueError("atalho vazio")
+        self.stop()
+        tracker = ComboTracker(keys, on_down, on_up)
+        self.tracker = tracker
+        if key_parts:
+            def on_press(key):
+                kl = self.kl
+                if kl is not None:
+                    tracker.press(kl.canonical(key))
+
+            def on_release(key):
+                kl = self.kl
+                if kl is not None:
+                    tracker.release(kl.canonical(key))
+
+            self.kl = keyboard.Listener(on_press=on_press, on_release=on_release)
+            self.kl.daemon = True
+            self.kl.start()
+        if mouse_parts:
+            def on_click(x, y, button, pressed):
+                token = _mouse_token(button)
+                if token in tracker.keys:
+                    (tracker.press if pressed else tracker.release)(token)
+
+            self.ml = mouse.Listener(on_click=on_click)
+            self.ml.daemon = True
+            self.ml.start()
+
+    def stop(self):
+        for listener in (self.kl, self.ml):
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+        self.kl = self.ml = None
+
+
+class HotkeyManager:
+    """Atalho global de alternar. Com botão do mouse no atalho usa o ComboListener."""
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.listener = None
+        self.mouse_listener = None
 
     def start(self, combo):
         from pynput import keyboard
 
-        keys = keyboard.HotKey.parse(combo)  # levanta ValueError se for inválido
+        if combo_has_mouse(combo):
+            new = ComboListener()
+            new.start(combo, self.callback, lambda: None)  # levanta ValueError se for inválido
+            self.stop()
+            self.mouse_listener = new
+            return
+        keyboard.HotKey.parse(combo)  # levanta ValueError se for inválido
         self.stop()
-        self.tracker = ComboTracker(keys, lambda: self.on_change(True), lambda: self.on_change(False))
-        self.listener = keyboard.Listener(on_press=self._press, on_release=self._release)
+        self.listener = keyboard.GlobalHotKeys({combo: self.callback})
         self.listener.daemon = True
         self.listener.start()
 
-    def _press(self, key):
-        listener, tracker = self.listener, self.tracker
-        if listener is not None and tracker is not None:
-            tracker.press(listener.canonical(key))
-
-    def _release(self, key):
-        listener, tracker = self.listener, self.tracker
-        if listener is not None and tracker is not None:
-            tracker.release(listener.canonical(key))
-
     def stop(self):
-        was_active = self.tracker is not None and self.tracker.active
         if self.listener is not None:
             try:
                 self.listener.stop()
             except Exception:
                 pass
-        self.listener = None
-        self.tracker = None
+            self.listener = None
+        if self.mouse_listener is not None:
+            self.mouse_listener.stop()
+            self.mouse_listener = None
+
+
+class PushToTalk:
+    """Tecla global de apertar para falar: on_change(True) ao apertar, on_change(False) ao soltar."""
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.cl = ComboListener()
+
+    @property
+    def tracker(self):
+        return self.cl.tracker
+
+    def start(self, combo):
+        was_active = self.cl.active
+        self.cl.start(combo, lambda: self.on_change(True), lambda: self.on_change(False))
+        if was_active:
+            self.on_change(False)
+
+    def stop(self):
+        was_active = self.cl.active
+        self.cl.stop()
+        self.cl.tracker = None
         if was_active:
             self.on_change(False)  # não deixa o microfone aberto
 
@@ -483,12 +559,30 @@ def activate_hotkeys(cfg, toggle_mgr, ptt_mgr):
             ptt_mgr.start(cfg["ptt_hotkey"])  # segurar para falar enquanto estiver mutado
 
 
-def record_hotkey(on_done):
-    """Escuta a próxima combinação de teclas e entrega no formato do pynput."""
-    from pynput import keyboard
+class _Recorder:
+    """Gravação de atalho em andamento (teclado e mouse). stop() cancela."""
 
+    def __init__(self):
+        self.listeners = []
+        self.finished = False
+
+    def stop(self):
+        self.finished = True
+        for listener in self.listeners:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+
+
+def record_hotkey(on_done, on_cancel=None):
+    """Escuta o próximo atalho (teclas e/ou botão do mouse). Esc cancela.
+
+    Devolve um objeto com stop(). Chama on_done(combo) no formato do pynput."""
+    from pynput import keyboard, mouse
+
+    rec = _Recorder()
     mods = set()
-    done = {"flag": False}
     order = ["ctrl", "alt", "shift", "cmd"]
     alias = {
         "ctrl_l": "ctrl", "ctrl_r": "ctrl", "ctrl": "ctrl",
@@ -510,8 +604,20 @@ def record_hotkey(on_done):
             return f"<{vk}>", False
         return None, False
 
+    def finish(combo):
+        if rec.finished:
+            return False
+        rec.stop()
+        on_done(combo)
+        return False
+
     def on_press(key):
-        if done["flag"]:
+        if rec.finished:
+            return False
+        if key == keyboard.Key.esc:
+            rec.stop()
+            if on_cancel:
+                on_cancel()
             return False
         name, is_mod = key_name(key)
         if name is None:
@@ -527,24 +633,40 @@ def record_hotkey(on_done):
             key_part = name
         else:
             key_part = f"<{name}>"
-        combo = "+".join(mod_parts + [key_part])
-        done["flag"] = True
-        on_done(combo)
-        return False
+        return finish("+".join(mod_parts + [key_part]))
 
     def on_release(key):
         name, is_mod = key_name(key)
         if is_mod:
             mods.discard(name)
 
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.daemon = True
-    listener.start()
-    return listener
+    def on_click(x, y, button, pressed):
+        if rec.finished:
+            return False
+        token = _mouse_token(button)
+        if not pressed or token is None:
+            return None  # esquerdo e direito não valem: são usados na própria tela
+        if token == "<mouse_middle>" and not mods:
+            return None  # o botão do meio sozinho dispararia sem querer; use com Ctrl/Alt/Shift
+        mod_parts = [f"<{m}>" for m in order if m in mods]
+        return finish("+".join(mod_parts + [token]))
+
+    kl = keyboard.Listener(on_press=on_press, on_release=on_release)
+    kl.daemon = True
+    ml = mouse.Listener(on_click=on_click)
+    ml.daemon = True
+    rec.listeners = [kl, ml]
+    kl.start()
+    try:
+        ml.start()
+    except Exception:
+        pass  # sem mouse global (ex.: Wayland): o teclado continua valendo
+    return rec
 
 
 def pretty_combo(combo):
     names = {"<ctrl>": "Ctrl", "<alt>": "Alt", "<shift>": "Shift", "<cmd>": "Cmd"}
+    names.update(MOUSE_TOKENS)
     out = []
     for part in combo.split("+"):
         if part in names:
@@ -1259,13 +1381,14 @@ class NoiseSuppressor:
 # Iniciar com o computador
 # --------------------------------------------------------------------------
 def _launch_args():
-    """Comando que reabre o Mutinho escondido na bandeja."""
+    """Comando que abre o Mutinho no login. Se vai ficar escondido na bandeja ou não,
+    quem decide é a opção "Iniciar escondido" (não o atalho)."""
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--hidden"]
+        return [sys.executable]
     exe = sys.executable
     if SYSTEM == "Windows" and exe.lower().endswith("python.exe"):
         exe = exe[:-10] + "pythonw.exe"  # sem janela de console
-    return [exe, os.path.abspath(sys.argv[0]), "--hidden"]
+    return [exe, os.path.abspath(sys.argv[0])]
 
 
 def _startup_shortcut():
@@ -1584,6 +1707,21 @@ def app_icon_image(size=64):
     return img
 
 
+def enable_dpi_awareness():
+    """Windows: sem isso o sistema estica a janela (bitmap) e o texto fica borrado."""
+    if SYSTEM != "Windows":
+        return
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # Windows 8.1+
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()        # Windows 7/8
+    except Exception:
+        pass
+
+
 class _Slider:
     """Controle deslizante desenhado no Canvas (trilho fino e botão redondo)."""
 
@@ -1692,6 +1830,9 @@ class GUI:
         self.updating = False
         self.fullscreen = False
         self.scale = 1.0
+        self.dpi = 1.0              # fator da tela (125% = 1.25); calculado depois de criar a janela
+        self._frozen = False
+        self._transition = False
         self.holding = False
         self.hold_t0 = 0.0
         self.maxed = False          # janela maximizada (botão quadrado): usa o layout grande
@@ -1701,15 +1842,25 @@ class GUI:
         self._placed = False
         self.rec_key = "hotkey"
         self.rec_which = "main"
+        self.rec_handle = None
 
         self.root = tk.Tk()
+        # Início escondido: some antes de aparecer (senão a janela pisca e depois esconde)
+        self.want_hidden = bool(start_hidden or self.cfg["start_hidden"]) and SYSTEM != "Darwin"
+        if self.want_hidden:
+            self.root.withdraw()
+        try:
+            self.dpi = min(3.0, max(1.0, self.root.winfo_fpixels("1i") / 96.0))
+        except Exception:
+            self.dpi = 1.0
         self.root.title(APP_NAME)
         self.root.configure(bg=self.BG)
+        self._style_titlebar()   # antes de a janela aparecer: a barra já nasce escura
         self.root.resizable(True, True)
         self.root.attributes("-topmost", bool(self.cfg["on_top"]))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<F11>", lambda e: self._toggle_fullscreen())
-        self.root.bind("<Escape>", lambda e: self._exit_fullscreen())
+        self.root.bind("<Escape>", lambda e: self._on_escape())
         self.root.bind("<Configure>", self._on_configure)
 
         self._make_fonts()
@@ -1735,11 +1886,11 @@ class GUI:
         hidden = False
         if self.tray is not None:
             self._say("Fechar a janela mantém o Mutinho na bandeja. Para sair, use o ícone perto do relógio.")
-            if start_hidden or self.cfg["start_hidden"]:
-                self.root.withdraw()
-                hidden = True
+            hidden = self.want_hidden
         else:
             self._say("Bandeja indisponível (instale pystray e pillow). Fechar a janela encerra o app.")
+            if self.want_hidden:
+                self.root.deiconify()  # sem bandeja não dá para reabrir: mostra a janela
         if start_fullscreen and not hidden:
             self.root.after(300, self._enter_fullscreen)
 
@@ -1761,6 +1912,7 @@ class GUI:
         """Barra de título escura (minimizar, maximizar, fechar) no Windows 10/11."""
         if SYSTEM != "Windows" or os.environ.get("MUTINHO_NO_TITLEBAR"):
             return
+        status = {}
         try:
             import ctypes
             from ctypes import wintypes
@@ -1782,17 +1934,28 @@ class GUI:
             def rgb(color):  # COLORREF = 0x00BBGGRR
                 return int(color[5:7], 16) << 16 | int(color[3:5], 16) << 8 | int(color[1:3], 16)
 
-            if put(20, 1) != 0:      # modo escuro (Windows 10 20H1+ e 11)
-                put(19, 1)           # versões mais antigas do Windows 10
-            put(35, rgb(self.BG))    # cor da barra (só Windows 11)
-            put(36, rgb(self.FG))    # cor do texto (só Windows 11)
-            put(34, rgb(self.BORDER))  # cor da borda (só Windows 11)
-            # força o Windows a redesenhar a barra de título
+            status["dark20"] = put(20, 1)     # modo escuro (Windows 10 20H1+ e 11)
+            if status["dark20"] != 0:
+                status["dark19"] = put(19, 1)  # versões mais antigas do Windows 10
+            put(35, rgb(self.BG))              # cor da barra (só Windows 11)
+            put(36, rgb(self.FG))              # cor do texto (só Windows 11)
+            put(34, rgb(self.BORDER))          # cor da borda (só Windows 11)
             user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                             ctypes.c_int, ctypes.c_int, wintypes.UINT]
-            user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0037)
-        except Exception:
-            pass
+            user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0037)  # redesenha a moldura
+            # No Windows 10 a barra só repinta com uma mudança visível: o truque do alpha
+            if self.root.winfo_viewable():
+                alpha = self.root.attributes("-alpha")
+                self.root.attributes("-alpha", 0.99)
+                self.root.attributes("-alpha", alpha)
+        except Exception as exc:
+            status["erro"] = repr(exc)
+        if status.get("erro") or (status.get("dark20") and status.get("dark19")):
+            try:
+                with open(os.path.join(os.path.expanduser("~"), "mutinho-titlebar.log"), "w") as f:
+                    f.write(repr(status))
+            except Exception:
+                pass
 
     def _button(self, parent, text, command, kind="primary", small=False):
         tk = self.tk
@@ -1846,12 +2009,12 @@ class GUI:
 
     def _segmented(self, parent, items, on_click, font="h10b", expand=False):
         tk = self.tk
-        track = tk.Frame(parent, bg=self.BG, padx=3, pady=3, highlightthickness=1,
+        track = tk.Frame(parent, bg=self.BG, padx=self.S(3), pady=self.S(3), highlightthickness=1,
                          highlightbackground=self.BORDER, highlightcolor=self.BORDER)
         btns = {}
         for i, (key, text) in enumerate(items):
             lbl = tk.Label(track, text=text, bg=self.BG, fg=self.DIM, font=self.fonts[font],
-                           padx=14, pady=6, cursor="hand2")
+                           padx=self.S(14), pady=self.S(6), cursor="hand2")
             lbl.bind("<Button-1>", lambda e, k=key: on_click(k))
             if expand:
                 lbl.grid(row=0, column=i, sticky="ew")
@@ -1888,8 +2051,10 @@ class GUI:
         for w in frame.winfo_children():
             w.destroy()
         if note:
-            tk.Label(frame, text=note, bg=self.CARD, fg=self.SEG_ON_FG,
-                     font=self.fonts["h10b"]).pack(side="left")
+            tk.Label(frame, text="●  " + note, bg="#13233f", fg=self.SEG_ON_FG,
+                     font=self.fonts["h10b"], padx=self.S(12), pady=self.S(6),
+                     highlightthickness=1, highlightbackground=self.ACCENT,
+                     highlightcolor=self.ACCENT).pack(side="left")
             return
         parts = [p.strip() for p in pretty_combo(combo).split(" + ")]
         for i, part in enumerate(parts):
@@ -1907,9 +2072,9 @@ class GUI:
         main_note = hold_note = None
         if self.recording:
             if self.rec_which == "hold":
-                hold_note = "Pressione a nova tecla…"
+                hold_note = "Aperte a tecla…"
             else:
-                main_note = "Pressione o novo atalho…"
+                main_note = "Aperte o atalho…"
         self.hotkey_text = pretty_combo(self.cfg["ptt_hotkey" if ptt else "hotkey"])
         self._set_caps(self.hotkey_caps, self.cfg["ptt_hotkey" if ptt else "hotkey"], main_note)
         self._set_caps(self.hold_caps, self.cfg["ptt_hotkey"], hold_note)
@@ -1982,7 +2147,7 @@ class GUI:
         row.pack(fill="x")
         self.hotkey_caps = tk.Frame(row, bg=self.CARD)
         self.hotkey_caps.pack(side="left")
-        self.record_btn = self._button(row, "Alterar", lambda: self._start_recording("main"),
+        self.record_btn = self._button(row, "Alterar", lambda: self._toggle_recording("main"),
                                        kind="ghost", small=True)
         self.record_btn.pack(side="right")
 
@@ -1995,9 +2160,14 @@ class GUI:
         hrow.pack(fill="x")
         self.hold_caps = tk.Frame(hrow, bg=self.CARD)
         self.hold_caps.pack(side="left")
-        self.hold_btn = self._button(hrow, "Alterar", lambda: self._start_recording("hold"),
+        self.hold_btn = self._button(hrow, "Alterar", lambda: self._toggle_recording("hold"),
                                      kind="ghost", small=True)
         self.hold_btn.pack(side="right")
+        self.rec_hint = tk.Label(
+            card, bg=self.CARD, fg=self.SEG_ON_FG, font=self.fonts["h9"], justify="left",
+            text="Aperte agora o atalho que você quer usar: teclas (com Ctrl, Alt ou Shift; "
+                 "as teclas F valem sozinhas) ou botão lateral do mouse.\n"
+                 "Esc cancela.", wraplength=self.CW - 60)
         self._update_hotkey_label()
 
         # ===== painel B: celular =====
@@ -2116,6 +2286,10 @@ class GUI:
         matrix = qr.get_matrix()
         cell = max(2, self.S(self.QR) // len(matrix))
         size = cell * len(matrix)
+        self.url_label.configure(text=url)
+        if getattr(self, "_qr_key", None) == (url, cell):
+            return  # mesmo desenho: não refaz (deixa a troca de tela mais rápida)
+        self._qr_key = (url, cell)
         self.qr_canvas.delete("all")
         self.qr_canvas.configure(width=size, height=size)
         for y, row in enumerate(matrix):
@@ -2234,7 +2408,7 @@ class GUI:
                 pass
 
     def S(self, n):
-        return int(round(n * self.scale))
+        return int(round(n * self.scale * self.dpi))
 
     def _set_scale(self, scale):
         self.scale = scale
@@ -2328,8 +2502,8 @@ class GUI:
         root = self.root
         self._set_scale(1.0)
         root.update_idletasks()
-        aw = root.winfo_screenwidth() - 60
-        ah = root.winfo_screenheight() - 110   # barra de tarefas + barra de título
+        aw = root.winfo_screenwidth() - int(60 * self.dpi)
+        ah = root.winfo_screenheight() - int(110 * self.dpi)   # barra de tarefas + barra de título
         w = max(1, self.container.winfo_reqwidth())
         h = max(1, self.container.winfo_reqheight())
         scale = min(1.0, aw / w, ah / h)
@@ -2379,34 +2553,64 @@ class GUI:
             return False
 
     def _on_configure(self, event):
-        if event.widget is not self.root or self.fullscreen:
+        if event.widget is not self.root or self.fullscreen or self._transition:
             return
+        if self._is_maximized() != self.maxed:
+            self._freeze()  # a janela mudou de estado: esconde o conteúdo até o novo layout ficar pronto
         if self._cfg_job is not None:
             try:
                 self.root.after_cancel(self._cfg_job)
             except Exception:
                 pass
-        self._cfg_job = self.root.after(120, self._sync_maximized)
+        self._cfg_job = self.root.after(40, self._sync_maximized)
 
     def _sync_maximized(self):
         """Maximizada: usa as três colunas e aumenta o zoom até ocupar a janela. Restaurada: volta ao normal."""
         self._cfg_job = None
-        if self.fullscreen:
+        if self.fullscreen or self._transition:
             return
-        if self._is_maximized():
-            size = (self.root.winfo_width(), self.root.winfo_height())
-            if not self.maxed or size != self._maxed_size:
-                self.maxed = True
-                self._maxed_size = size
-                self.root.minsize(1, 1)
-                self._layout(True)
-                self._fit_to_area(*size)
-        elif self.maxed:
-            self.maxed = False
-            self._maxed_size = None
-            self._set_scale(1.0)
-            self._layout(False)
-            self._set_normal_size(force=True)
+        try:
+            if self._is_maximized():
+                size = (self.root.winfo_width(), self.root.winfo_height())
+                if not self.maxed or size != self._maxed_size:
+                    self.maxed = True
+                    self._maxed_size = size
+                    self.root.minsize(1, 1)
+                    self._layout(True)
+                    self._fit_to_area(*size)
+            elif self.maxed:
+                self.maxed = False
+                self._maxed_size = None
+                self._layout(False)
+                self._set_normal_size(force=True)
+        finally:
+            self._thaw()
+
+    # ---- troca de modo sem "piscar" ---------------------------------------
+    def _freeze(self):
+        """Esconde o conteúdo durante a troca de layout: só aparece quando estiver pronto."""
+        if not self._frozen:
+            self._frozen = True
+            self.container.place_forget()
+            self.root.after(1500, self._thaw)  # segurança: nunca fica escondido para sempre
+
+    def _thaw(self):
+        if self._frozen:
+            self._frozen = False
+            self.root.update_idletasks()
+            self.container.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _thaw_when(self, condition, tries=40):
+        """Mostra o conteúdo quando a janela chegar ao tamanho final (ou após ~0,6 s)."""
+        try:
+            ready = condition()
+        except Exception:
+            ready = True
+        if ready or tries <= 0:
+            self._thaw()
+            self._transition = False
+        else:
+            self.root.after(15, lambda: self._thaw_when(condition, tries - 1))
 
     def _toggle_fullscreen(self):
         if self.fullscreen:
@@ -2418,6 +2622,8 @@ class GUI:
         if self.fullscreen:
             return
         self._was_zoomed = self.maxed or self._is_maximized()
+        self._transition = True
+        self._freeze()
         self.fullscreen = True
         self.maxed = False
         self.root.deiconify()
@@ -2428,19 +2634,33 @@ class GUI:
         self.fs_btn.configure(text="Sair da tela cheia (Esc)")
         self.root.lift()
         self.root.focus_force()
+        sw = self.root.winfo_screenwidth()
+        self._thaw_when(lambda: self.root.winfo_width() >= sw - 4)
 
     def _exit_fullscreen(self):
         if not self.fullscreen:
             return
+        self._transition = True
+        self._freeze()
         self.fullscreen = False
         self.root.attributes("-fullscreen", False)
-        self._set_scale(1.0)
-        self._layout(False)
         self.fs_btn.configure(text="Tela cheia (F11)")
+        self._finish_exit(40)
+
+    def _finish_exit(self, tries):
         if self._was_zoomed:
-            self.root.after(250, self._sync_maximized)  # voltou maximizada: refaz o zoom
-        else:
-            self._set_normal_size(force=True)
+            # voltou maximizada: espera o Windows restaurar e refaz o zoom
+            if not self._is_maximized() and tries > 0:
+                self.root.after(15, lambda: self._finish_exit(tries - 1))
+                return
+            self.maxed = False
+            self._transition = False
+            self._sync_maximized()
+            return
+        self._layout(False)
+        self._set_normal_size(force=True)
+        w = self.container.winfo_reqwidth()
+        self._thaw_when(lambda: abs(self.root.winfo_width() - w) <= 6)
 
     def refresh(self):
         try:
@@ -2480,7 +2700,10 @@ class GUI:
                 elif kind == "msg":
                     self._say(payload)
                 elif kind == "hotkey":
-                    self._apply_hotkey(payload)
+                    if self.recording:
+                        self._apply_hotkey(payload)
+                elif kind == "hotkey_cancel":
+                    self._cancel_recording()
                 elif kind == "show":
                     self.show()
                 elif kind == "quit":
@@ -2516,25 +2739,64 @@ class GUI:
         self.root.after(100, self._pump_events)
 
     # ---- atalho -----------------------------------------------------------
+    def _on_escape(self):
+        if self.recording:
+            self._cancel_recording()
+        else:
+            self._exit_fullscreen()
+
+    def _toggle_recording(self, which="main"):
+        if self.recording:
+            self._cancel_recording()
+        else:
+            self._start_recording(which)
+
+    def _set_recording_ui(self, on, which="main"):
+        for btn in (self.record_btn, self.hold_btn):
+            btn.configure(text="Alterar", fg=self.FG)
+        if on:
+            (self.hold_btn if which == "hold" else self.record_btn).configure(
+                text="Cancelar (Esc)", fg="#ff8a8e")
+            self.rec_hint.configure(wraplength=self.S(self.CW - 60))
+            self.rec_hint.pack(anchor="w", pady=(14, 0))
+        else:
+            self.rec_hint.pack_forget()
+        self._render_caps()
+        self._set_normal_size()
+
     def _start_recording(self, which="main"):
         if self.recording:
             return
         ptt = self.cfg["mode"] == "ptt"
         self.rec_key = "ptt_hotkey" if (ptt or which == "hold") else "hotkey"
         self.rec_which = which
+        events = self.ctrl.events
         try:
-            record_hotkey(lambda combo: self.ctrl.events.put(("hotkey", combo)))
+            self.rec_handle = record_hotkey(lambda combo: events.put(("hotkey", combo)),
+                                            lambda: events.put(("hotkey_cancel", None)))
         except Exception as exc:
             self._say(f"Não foi possível gravar o atalho: {exc}")
             return
         self.recording = True
-        self._render_caps()
-        (self.hold_btn if which == "hold" else self.record_btn).configure(text="Gravando…")
+        self._set_recording_ui(True, which)
+        self._say("Gravando atalho: aperte as teclas ou um botão do mouse. Esc cancela.")
+
+    def _cancel_recording(self):
+        if not self.recording:
+            return
+        if self.rec_handle is not None:
+            self.rec_handle.stop()
+            self.rec_handle = None
+        self.recording = False
+        self._set_recording_ui(False)
+        self._say("Gravação cancelada. O atalho continua o mesmo.")
 
     def _apply_hotkey(self, combo):
         self.recording = False
-        self.record_btn.configure(text="Alterar")
-        self.hold_btn.configure(text="Alterar")
+        self.rec_handle = None
+        self.rec_hint.pack_forget()
+        self.record_btn.configure(text="Alterar", fg=self.FG)
+        self.hold_btn.configure(text="Alterar", fg=self.FG)
         key = self.rec_key
         previous = self.cfg[key]
         self.cfg[key] = combo
@@ -2957,6 +3219,7 @@ class GUI:
 # Entrada
 # --------------------------------------------------------------------------
 def main():
+    enable_dpi_awareness()
     try:  # falhas nativas (fecha sem erro do Python) também ficam registradas
         import faulthandler
 

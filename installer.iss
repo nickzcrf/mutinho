@@ -4,7 +4,7 @@
 ;   vbcable\                          (conteúdo extraído do pacote do VB-CABLE, de vb-audio.com/Cable)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.6.1"
+  #define MyAppVersion "1.6.2"
 #endif
 #define MyAppName "Mutinho"
 #define MyAppExe "Mutinho.exe"
@@ -39,7 +39,7 @@ Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortugue
 
 [Tasks]
 Name: "vbcable"; Description: "Instalar o microfone virtual (VB-CABLE), necessário para a redução de ruído funcionar no Meet, Discord e Zoom"; GroupDescription: "Redução de ruído:"
-Name: "autostart"; Description: "Iniciar o Mutinho junto com o Windows (escondido na bandeja)"; GroupDescription: "Opções:"
+Name: "autostart"; Description: "Iniciar o Mutinho junto com o Windows"; GroupDescription: "Opções:"; Flags: unchecked
 Name: "desktopicon"; Description: "Criar atalho na área de trabalho"; GroupDescription: "Opções:"
 
 [Files]
@@ -50,7 +50,7 @@ Source: "vbcable\*"; DestDir: "{tmp}\vbcable"; Flags: recursesubdirs createallsu
 [Icons]
 Name: "{autoprograms}\Mutinho"; Filename: "{app}\{#MyAppExe}"
 Name: "{autodesktop}\Mutinho"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
-Name: "{userstartup}\Mutinho"; Filename: "{app}\{#MyAppExe}"; Parameters: "--hidden"; Tasks: autostart
+Name: "{userstartup}\Mutinho"; Filename: "{app}\{#MyAppExe}"; Tasks: autostart
 
 [Run]
 ; "-i -h": instala sem a tela do instalador do VB-CABLE. O Windows ainda pede a confirmação do driver.
