@@ -1,6 +1,6 @@
 {
-  "version": "1.6.3",
+  "version": "1.6.4",
   "url": "dist/Mutinho.exe",
-  "sha256": "077c79e705259733003fc4e7f389dfd5ade9fddc06fa98810846cfaf5bcceb9d",
-  "notes": "Início respeita a opção de escondido"
+  "sha256": "d898e79f12b84fc0207a8f553b45632485dd98a4b00870291ec52b364ec784c2",
+  "notes": "Modo seguro ao iniciar e log de erro"
 }

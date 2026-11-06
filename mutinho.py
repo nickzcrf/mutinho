@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urljoin, urlparse
 
 APP_NAME = "Mutinho"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 # Endereço do version.json publicado no seu site (troque SEU-SITE pelo seu domínio da Vercel).
 # Enquanto contiver "SEU-SITE", a verificação de atualização fica desligada.
 UPDATE_URL = "https://mutinho.vercel.app/version.json"
@@ -1846,6 +1846,7 @@ class GUI:
 
         self.root = tk.Tk()
         # Início escondido: some antes de aparecer (senão a janela pisca e depois esconde)
+        self.root.after(4000, _clear_start_mark)
         self.want_hidden = bool(start_hidden or self.cfg["start_hidden"]) and SYSTEM != "Darwin"
         if self.want_hidden:
             self.root.withdraw()
@@ -1910,7 +1911,7 @@ class GUI:
 
     def _style_titlebar(self):
         """Barra de título escura (minimizar, maximizar, fechar) no Windows 10/11."""
-        if SYSTEM != "Windows" or os.environ.get("MUTINHO_NO_TITLEBAR"):
+        if SYSTEM != "Windows" or SAFE_MODE or os.environ.get("MUTINHO_NO_TITLEBAR"):
             return
         status = {}
         try:
@@ -3218,13 +3219,49 @@ class GUI:
 # --------------------------------------------------------------------------
 # Entrada
 # --------------------------------------------------------------------------
+_HOME = os.path.expanduser("~")
+_START_MARK = os.path.join(_HOME, ".mutinho-iniciando")
+_SAFE_FLAG = os.path.join(_HOME, "mutinho-modo-seguro.txt")
+SAFE_MODE = False
+
+
+def _clear_start_mark():
+    """Chamada depois de alguns segundos de funcionamento: o início deu certo."""
+    try:
+        os.remove(_START_MARK)
+    except OSError:
+        pass
+
+
 def main():
-    enable_dpi_awareness()
+    global SAFE_MODE
+    log_path = os.path.join(_HOME, "mutinho-erro.log")
+    try:  # guarda o erro da execução anterior antes de começar um log novo
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
+            os.replace(log_path, os.path.join(_HOME, "mutinho-erro-anterior.log"))
+    except OSError:
+        pass
+    # Se a execução anterior não chegou a funcionar por alguns segundos (fechou sozinha),
+    # liga o modo seguro: sem os recursos de tela do Windows (nitidez e barra escura).
+    try:
+        if not os.path.exists(_SAFE_FLAG) and os.path.exists(_START_MARK):
+            with open(_SAFE_FLAG, "w", encoding="utf-8") as f:
+                f.write("O Mutinho fechou sozinho ao iniciar, então entrou em modo seguro "
+                        "(sem barra de título escura e sem ajuste de nitidez).\n"
+                        "Para tentar de novo, apague este arquivo.\n")
+        SAFE_MODE = os.path.exists(_SAFE_FLAG)
+        if not SAFE_MODE:
+            with open(_START_MARK, "w") as f:
+                f.write("1")
+    except OSError:
+        pass
+    if not SAFE_MODE:
+        enable_dpi_awareness()
     try:  # falhas nativas (fecha sem erro do Python) também ficam registradas
         import faulthandler
 
         global _FAULT_LOG
-        _FAULT_LOG = open(os.path.join(os.path.expanduser("~"), "mutinho-erro.log"), "w")
+        _FAULT_LOG = open(log_path, "w")
         faulthandler.enable(file=_FAULT_LOG)
     except Exception:
         pass
