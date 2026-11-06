@@ -106,7 +106,6 @@ Não coloque a pasta `vbcable\` no GitHub se preferir; ela só é necessária pa
 ## Opções
 
 - `python mutinho.py --no-gui`: sem janela (mostra o QR no terminal).
-- `python mutinho.py --hidden`: abre já escondido na bandeja.
 - `python mutinho.py --fullscreen`: abre já em tela cheia.
 - Configuração salva em `~/.mutinho.json`.
 

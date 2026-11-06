@@ -14,7 +14,7 @@ Muta o microfone com um atalho global e desmuta pelo celular com um QR code. Gr�
 - **Ouvir a própria voz** nos fones, com controle de volume. Funciona com ou sem a redução de ruído (com ela ligada, você ouve o áudio já limpo). Use fones para não dar eco.
 - **Tela cheia** (`F11`) e janela **maximizável**: a interface se adapta ao tamanho.
 - **Bandeja do sistema**, indicador flutuante, som ao mutar e início escondido.
-- **Iniciar com o computador**, escondido na bandeja (opção na janela ou no instalador).
+- **Iniciar com o computador** (opção na janela ou no instalador). Para abrir já escondido na bandeja, ligue "Iniciar escondido na bandeja" nas opções do app.
 - **Atualização automática** com verificação SHA-256 (versão `.exe`/instalador no Windows).
 
 ## Instalação
@@ -79,7 +79,6 @@ Requer Python 3.10+ com tkinter.
 ```bash
 pip install -r requirements.txt
 python mutinho.py            # abre a janela
-python mutinho.py --hidden   # inicia escondido na bandeja
 python mutinho.py --fullscreen
 python mutinho.py --fake     # microfone simulado, para testes
 ```
