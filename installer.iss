@@ -4,7 +4,7 @@
 ;   vbcable\                          (conteúdo extraído do pacote do VB-CABLE, de vb-audio.com/Cable)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.6.2"
+  #define MyAppVersion "1.6.3"
 #endif
 #define MyAppName "Mutinho"
 #define MyAppExe "Mutinho.exe"

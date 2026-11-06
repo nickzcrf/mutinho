@@ -1,6 +1,6 @@
 {
-  "version": "1.6.2",
+  "version": "1.6.3",
   "url": "dist/Mutinho.exe",
-  "sha256": "68306ce0e4fc887c57611e1efeae5f0dd6d58d5e34701c7dfe5b3d3910d5264a",
-  "notes": "Atalhos com mouse, Esc cancela, tela mais nítida, troca de tela suave"
+  "sha256": "077c79e705259733003fc4e7f389dfd5ade9fddc06fa98810846cfaf5bcceb9d",
+  "notes": "Início respeita a opção de escondido"
 }
